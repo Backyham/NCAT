@@ -45,9 +45,9 @@ for word_list in trans_result['segments']:
         vb_text = word['word'].replace(" ","").replace(".","")
 
         if position > 0:
-            vb_start -= 500
-            vb_end += 350
-            if vb_start < 0: vb_start = prev
+            vb_start -= 400
+            vb_end += 100
+            if vb_start < prev: vb_start = prev +1
             if vb_start < 0: vb_start = 0
 
         vbjson_dict['transcript']['words'].append(

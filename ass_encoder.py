@@ -14,6 +14,9 @@ sub_file = input("ASS file, please.\n")
 output_file = '[BE4K6M]' + video_file.split('.')[0] + '_NickLian.mp4'
 
 # Get framerate fot key frame distance - Seems incompatible with webm format.
+# Scratch that. I'm a idiot. 
+
+# ffprobe
 # if video_file.split('.')[1] == 'mp4':
 #    ffprobe_arg = ['ffprobe',
 #                    '-v', 'error',
@@ -31,13 +34,13 @@ ffmpeg_arg = ["ffmpeg",
               "-i", video_file,
               "-c:a", "aac",
               "-b:a", "320K",
-              "-c:v", "h264_nvenc",
-#             "-c:v", "libx264",
-              "-b:v", "7M",
-#             "-preset", "slow",
-#             "-crf", "20",
-#             "-maxrate", "10M",
-#             "-x264-params", "vbv-maxrate=10000:vbv-bufsize=40000",
+#             "-c:v", "h264_nvenc",
+              "-c:v", "libx264",
+              "-b:v", "20M",
+              "-preset", "slow",
+              "-crf", "20",
+              "-maxrate", "25M",
+              "-x264-params", "vbv-maxrate=1la0000:vbv-bufsize=40000",
 #             Even with Intel Core i7-13600K's six P-Cores, libx264 is to slow. 
 #             Not recommending for web publishment.
               "-filter_complex", 'scale=3840:-1:flags=lanczos[sc];[sc]ass=f=\'%s\'' % os.path.join(os.path.dirname(sub_file), sub_temp),

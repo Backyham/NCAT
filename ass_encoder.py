@@ -39,8 +39,10 @@ ffmpeg_arg = ["ffmpeg",
               "-b:v", "20M",
               "-preset", "slow",
               "-crf", "20",
+              "-minrate", "18M",
               "-maxrate", "25M",
-              "-x264-params", "vbv-maxrate=1la0000:vbv-bufsize=40000",
+              "-bufsize", "50M",
+#             "-x264-params", "vbv-maxrate=10000:vbv-bufsize=40000",
 #             Even with Intel Core i7-13600K's six P-Cores, libx264 is to slow. 
 #             Not recommending for web publishment.
               "-filter_complex", 'scale=3840:-1:flags=lanczos[sc];[sc]ass=f=\'%s\'' % os.path.join(os.path.dirname(sub_file), sub_temp),

@@ -10,15 +10,15 @@ And I, as of now, might not have the abillity to avoid this workaround.
 Not before Full-auto_M134A16.py reconstruction.
 '''
 # Modules
+import os
 import json
 import pathlib
 import whisper
 import subprocess
-from os.path import join as osjoin
-from nltk import tokenize, download
+import stable_whisper
 
-vbjson_dict = {"transcript":{"words":[]}}
-text = ''
+from os.path import join as osjoin
+from nltk    import tokenize, download
 
 def nltk_proc(text_result:str):
     try:
@@ -31,6 +31,13 @@ def nltk_proc(text_result:str):
 
 #Whisper transcribe
 def whisper2voicebase(extracted_audio:str, model_sel:int):
+    
+    vbjson_dict = {"transcript":{"words":[]}}
+    text = ''
+    
+    position = 0
+    prev = 0
+    
     if model_sel == 1:
         print("\nYou've selected Vanilla OpenAI Whisper ASR.\nProcessing with large-v3 model.\n")
         model = whisper.load_model('large-v3')
@@ -41,12 +48,10 @@ def whisper2voicebase(extracted_audio:str, model_sel:int):
                                        append_punctuations = '')
         text = nltk_proc(tran_result['text'])
         
-        position = 0
-        prev = 0
         for word_list in tran_result['segments']:
             for word in word_list['words']:
-                vb_start = int(word['start'] * 1000 - 300)
-                vb_end   = int(word['end'] * 1000)
+                vb_start = int(word['start'] * 1000 + 200)
+                vb_end   = int(word['end']   * 1000)
                 vb_text  = word['word'].replace(" ","").replace(".","")
                 # Thanks dummyx, again!
                 if vb_text == "" and position != 0:
@@ -76,18 +81,16 @@ def whisper2voicebase(extracted_audio:str, model_sel:int):
             result_json = json.load(f)
             
             text_temp = ''
-            position = 0
-            prev = 0
             for segment in result_json['transcription']:
                 text_temp += segment['text']
                 prev = segment['offsets']['from']
                 for token in segment['tokens']:
-                    vb_start = token['offsets']['from'] - 300
-                    vb_end   = token['offsets']['to']
+                    vb_start = token['offsets']['from'] + 300
+                    vb_end   = token['offsets']['to'] - 500
                     vb_text  = token['text'].replace(" ","").replace(".","")
                     
                     if vb_text == "" and position != 0:
-                        vbjson_dict['transcript']['words'][position-1]['e'] = vb_end
+                        vbjson_dict['transcript']['words'][position - 1]['e'] = vb_end
                         prev = vb_end
                         continue
                     
@@ -99,7 +102,50 @@ def whisper2voicebase(extracted_audio:str, model_sel:int):
                     position += 1
                     
             text = nltk_proc(text_temp)
-                        
+            
+    if model_sel == 3:
+        print("\nYou've selected stable-ts Enhanced Whisper ASR.\nProcessing with large-v3 model.\n")
+        model = stable_whisper.load_model('large-v3')
+        crude_result = model.transcribe(extracted_audio, 
+                                  verbose = False,
+                                  word_timestamps = True,
+                                  language = 'en',
+                                  vad = True
+                                  )
+        result = model.refine(extracted_audio, crude_result, precision = 0.02)
+        result.save_as_json(extracted_audio + '.json')
+        
+        with open(extracted_audio + '.json', 'r') as f:
+            result_json = json.load(f)
+            text_temp = ''
+            for segment in result_json['segments']:
+                text_temp += segment['text']
+                prev = segment['start']
+                for word in segment['words']:
+                    vb_start = int(word['start'] * 1000 - 50)
+                    vb_end   = int(word['end'] * 1000 + 250)
+                    vb_text  = word['word'].replace(" ","").replace(".","")
+                
+                    if vb_text == "" and position != 0:
+                        vbjson_dict['transcript']['words'][position - 1]['e'] = vb_end
+                        prev = vb_end
+                        continue
+                
+                    if vb_start < prev: vb_start = prev
+                
+                    vbjson_dict['transcript']['words'].append(
+                        {"p": position, "s": vb_start, "e": vb_end, "w": vb_text})
+                    prev = vb_end
+                    position += 1
+                    
+            text = nltk_proc(text_temp)
+    
+    if model_sel == 4:
+        pass
+        # Without redone M13A16, stable-ts with other asr is too much of a hassle.
+
+    os.remove(extracted_audio)
+    os.remove(extracted_audio + '.json')
     with open(extracted_audio.split('.')[0] + '.txt', 'w') as f:
         f.write(text)
     with open(extracted_audio.split('.')[0] + '.json', 'w') as f:

@@ -28,8 +28,6 @@ avail_asr = {"1":"Whisper ASR (OpenAI Vanilla Vesion)",
 
 def whisper_vanilla(audio:str):
     import whisper
-    vbjson_dict = {"transcript":{"words":[]}}
-    
     print("\nYou've selected Vanilla OpenAI Whisper ASR.\nProcessing with large-v3 model.\n")
     
     model = whisper.load_model('large-v3')
@@ -38,7 +36,9 @@ def whisper_vanilla(audio:str):
                                    initial_prompt = '', 
                                    prepend_punctuations = '', 
                                    append_punctuations = '')
-
+    vbjson_dict = {"transcript":{"words":[]}}
+    position = 0
+    prev = 0
     for word_list in tran_result['segments']:
         for word in word_list['words']:
             vb_start = int(word['start'] * 1000 + 200)
@@ -60,9 +60,7 @@ def whisper_vanilla(audio:str):
 def whipser_cpp(audio:str):
     import pathlib
     import subprocess as sp
-    from os.path import join as osjoin
-    vbjson_dict = {"transcript":{"words":[]}}
-    
+    from os.path import join as osjoin    
     print("\nYou've selected whisper.cpp.\nProcessing with large-v3 model.\n")
     
     directory = pathlib.Path(__file__).parent.resolve()
@@ -79,6 +77,9 @@ def whipser_cpp(audio:str):
     with open(audio + '.json', 'r') as f:
         result_json = json.load(f)
     
+    vbjson_dict = {"transcript":{"words":[]}}
+    position = 0
+    prev = 0
     text_temp = ''
     for segment in result_json['transcription']:
         text_temp += segment['text']
@@ -104,8 +105,8 @@ def whipser_cpp(audio:str):
 
 def whisper_ts(audio:str):
     import stable_whisper
-    vbjson_dict = {"transcript":{"words":[]}}
     print("\nYou've selected stable-ts Enhanced Whisper ASR.\nProcessing with large-v3 model.\n")
+    
     model = stable_whisper.load_model('large-v3')
     crude_result = model.transcribe(audio, 
                                     verbose = False,
@@ -119,6 +120,9 @@ def whisper_ts(audio:str):
         result_json = json.load(f)
         
     text_temp = ''
+    vbjson_dict = {"transcript":{"words":[]}}
+    position = 0
+    prev = 0
     for segment in result_json['segments']:
         text_temp += segment['text']
         prev = segment['start']

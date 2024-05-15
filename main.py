@@ -1,4 +1,4 @@
-import os, sys
+import os, sys, time
 
 import multiprocessing as mp
 
@@ -14,7 +14,7 @@ if __name__ == "__main__":
         print(index+'.', avail_asr[index])
     while True: 
         asr_select = int(input("Type the number: "))
-        if asr_select in set(avail_asr.keys()):
+        if str(asr_select) in set(avail_asr.keys()):
             break
         else:
             print("Invalid selection. Try again.")
@@ -36,6 +36,7 @@ if __name__ == "__main__":
     audio_transcode_args_list = []
     if video_path_list == []:
         print("Nothing provided. Exit.")
+        sys.exit(-1)
     else:
         for path in video_path_list:
             video_arg, audio_arg = transcode.transcode_args(path)
@@ -49,11 +50,13 @@ if __name__ == "__main__":
     for v_arg in video_transcode_args_list:
         v_tc_ps = transcode_pool.apply_async(transcode.transcode_func, (v_arg, ))
         ps_list.append(v_tc_ps)
+        time.sleep(1)
     transcode_pool.close()
-    
+    time.sleep(1)
     for a_arg in audio_transcode_args_list:
         a_tc_ps = transcribe_pool.apply_async(transcribe_func, (asr_select, a_arg))
         ps_list.append(a_tc_ps)
+        time.sleep(0.25)
     transcribe_pool.close()
     
     transcode_pool.join()

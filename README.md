@@ -18,7 +18,7 @@ My workflow follows Nixiesub's traditions, so basically this is how Nixiesub tra
 
 (EX indicates a heavy task that seems to be out of my capabilities.)
 
-- Step I: Get video.  -> `NULL`
+- Step I: Get video.  -> `(not implemented)`
 
   >Nixiesub uses Ad-Free version videos from LMG's own content subcription platform Floatplane.com.
 

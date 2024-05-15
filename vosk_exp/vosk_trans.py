@@ -11,7 +11,7 @@ import subprocess
 import sys
 import pathlib
 
-def transcode_for_whisper(video_input: str):
+def Pre_transcode(video_input: str):
     video_path = pathlib.Path(video_input)
     if video_input.startswith('~'):
         video_path = video_path.expanduser()
@@ -66,6 +66,6 @@ def transcode_for_whisper(video_input: str):
                 print("Failed. Failing-over to CPU encoding...")
                 sp = subprocess.run(video_tc_args, capture_output=True)
                 if sp.returncode != 0:
-                    raise SystemError("\nUnknown Error, return exit code", sp.returncode, ".\n未知错误，返回值", sp.returncode, "。")
+                    raise SystemError("\nUnknown Error, return exit code", sp.returncode, ".\n未知错误，FFmpeg返回值", sp.returncode, "。")
     
     return video_path.split(".")[0] + '.wav'

@@ -1,6 +1,7 @@
 from nltk import tokenize, download
 
-def nltk_proc(text_result:str):
+
+def nltk_proc(text_result: str):
     try:
         sentences = tokenize.sent_tokenize(text_result)
     except LookupError:

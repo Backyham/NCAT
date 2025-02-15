@@ -1,69 +1,73 @@
 import os, sys, time
 
-import multiprocessing as mp
-
 import transcode
 from transcribe import transcribe_func, avail_asr
+from file_in import input_cleanse
 
 from exception_proc import show_exception_and_exit
 sys.excepthook = show_exception_and_exit
 
 if __name__ == "__main__":
-    print("\nPlease select which version you'd like to use:")
+    print("\nPlease select which you'd like to use:")
     for index in avail_asr:
-        print(index+'.', avail_asr[index])
+        print(index+'.', avail_asr[index][0])
     while True: 
         asr_select = int(input("Type the number: "))
         if str(asr_select) in set(avail_asr.keys()):
-            break
+            if str(asr_select) in {4,5}:
+                print("ASR method did not implemented yet. Sorry and please choose another.\n该听写方式尚未实现，抱歉。请选择其他方式。")
+                continue
+            else: 
+                break
         else:
             print("Invalid selection. Try again.")
     
-    print("\nPlease put in the video file to transcribe, finish with a empty line: \n")
     video_path_list = []
     while True:
-        name = input()
-        if name == '':
+    #CLI UI:
+        print("\nPlease put in the video file to transcribe, EOF/Ctrl-D to finish: ")
+    #for i in file_list:
+    #   print i + "\n"
+    #
+        try:
+            name = input()
+            if input_cleanse(name) != None:
+                video_path_list.append(input_cleanse(name))
+        except EOFError:
             break
-        else:
-            try:
-                video_path_list.append(transcode.input_cleanse(name))
-            except FileNotFoundError:
-                print("File path do not exist. Check input and retry, please.\n")
-                continue
     
-    video_transcode_args_list = []
-    audio_transcode_args_list = []
+    transcode_args_list = []
     if video_path_list == []:
         print("Nothing provided. Exit.")
         sys.exit(-1)
     else:
         for path in video_path_list:
             video_arg, audio_arg = transcode.transcode_args(path)
-            video_transcode_args_list.append(video_arg)
-            audio_transcode_args_list.append(audio_arg)
+            transcode_args_list.append(video_arg)
+            transcode_args_list.append(audio_arg)
     
-    transcode_pool  = mp.Pool(min(8, os.cpu_count(), len(video_transcode_args_list)))
-    transcribe_pool = mp.Pool(min(4, os.cpu_count(), len(audio_transcode_args_list)))
-    ps_list = []
+    print("\nStep 1 - Transcode - Start.\n")
     
-    for v_arg in video_transcode_args_list:
-        v_tc_ps = transcode_pool.apply_async(transcode.transcode_func, (v_arg, ))
-        ps_list.append(v_tc_ps)
-        time.sleep(1)
-    transcode_pool.close()
-    time.sleep(1)
-    for a_arg in audio_transcode_args_list:
-        a_tc_ps = transcribe_pool.apply_async(transcribe_func, (asr_select, a_arg))
-        ps_list.append(a_tc_ps)
-        time.sleep(0.25)
-    transcribe_pool.close()
+    transcribe_traget = []
+    for arg in transcode_args_list:
+        try:
+            exitcode = transcode.transcode_func(arg)
+            if exitcode != 0:
+                raise SystemError(arg, exitcode)
+        except SystemError as error_inst:
+            if not '-vn' in error_inst.args[0]:
+                print('Video proxy transcode for task "' + error_inst.args[0][2] + '" failed. FFmpeg returned', error_inst.args[1], '. Video proxy may be not rendered.')
+                print('视频 "' + error_inst.args[0][2] + '" 的代理转码失败，FFmpeg返回值', error_inst.args[1], '，代理可能未能生成。\n')
+            else:
+                print('Audio transcode for task "' + error_inst.args[0][2] + '" failed. FFmpeg returned', error_inst.args[1], '. Audio may be not generated.')
+                print('视频 "' + error_inst.args[0][2] + '" 的音频转码失败，FFmpeg返回值', error_inst.args[1], '，音频文件可能未能生成。\n')
+        else:
+            if '-vn' in arg:
+                transcribe_traget.append(arg[-1])
+                
+    print("\nStep 1 finished.\nStep 2 - Transcribe - Start.\n")
     
-    transcode_pool.join()
-    transcribe_pool.join()
-    
-    for ps in ps_list:
-        if ps.get() != 0:
-            raise SystemError("Unknown Error, return exit code", ps.get(), ".\n未知错误，返回值", ps.get(), "。")
+    for i in transcribe_traget:
+        transcribe_func(asr_select, i)
     
     print("Finished.")

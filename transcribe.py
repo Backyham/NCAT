@@ -14,17 +14,16 @@ Not before Full-auto_M134A16.py reconstruction.
 '''
 import json, os, sys
 
-from transcode import transcode_func as tc
 from nltk_func import nltk_proc as np
 
 from exception_proc import show_exception_and_exit
 sys.excepthook = show_exception_and_exit
 
-avail_asr = {"1":"Whisper ASR (OpenAI Vanilla Vesion)",
-             "2":"whisper.cpp",
-             "3":"stable-ts Enhanced Whisper",
-             "4":"Alphacei Vosk",
-             "5":"Whisper/Vosk Mixture"}
+avail_asr = {"1":("Whisper ASR", "OpenAI Vanilla Version"),
+             "2":("whisper.cpp", "A C/C++ Whisper ASR implementation"),
+             "3":("stable-ts Enhanced Whisper", ""),
+             "4":("Alphacei Vosk", "Not Implemented"),
+             "5":("Whisper/Vosk Mixture","Not Implementedπ")}
 
 def whisper_vanilla(audio:str):
     import whisper
@@ -144,24 +143,20 @@ def whisper_ts(audio:str):
     os.remove(audio + '.json')
     return (vbjson_dict, text_temp)
     
-def transcribe_func(asr_sel:int, audio_arg_list:list): 
-    if asr_sel in {4,5}:
-        raise NotImplementedError("\nASR method did not implemented yet. Sorry.")
-    
-    tc(audio_arg_list)
-    
+def transcribe_func(asr_sel:int, audio:str): 
+    output_filename = '.'.join(audio.split('.')[0:-1]) if len(audio.split('.')[0:-1]) > 1 else audio.split('.')[0]
     if asr_sel == 1:
-        result_json, full_text = whisper_vanilla(audio_arg_list[-1])
+        result_json, full_text = whisper_vanilla(audio)
     elif asr_sel == 2:
-        result_json, full_text = whipser_cpp(audio_arg_list[-1])
+        result_json, full_text = whipser_cpp(audio)
     elif asr_sel == 3:
-        result_json, full_text = whisper_ts(audio_arg_list[-1])
+        result_json, full_text = whisper_ts(audio)
     
-    with open(audio_arg_list[-1].split('.')[0] + '.txt', 'w') as f:
+    with open(output_filename + '.txt', 'w') as f:
         f.write(np(full_text))
-    with open(audio_arg_list[-1].split('.')[0] + '.json', 'w') as f:
+    with open(output_filename + '.json', 'w') as f:
         f.write(json.dumps(result_json))
-    os.remove(audio_arg_list[-1])
+    os.remove(audio)
     
     return 0
 

@@ -1,0 +1,3 @@
+# Backend: vLLM for HF safetensors (FP8 / BF16). Heavy.
+# vllm pulls in torch + cuda; install with the matching torch first.
+vllm>=0.5.0

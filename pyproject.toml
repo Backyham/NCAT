@@ -1,0 +1,53 @@
+[project]
+name = "ncat"
+version = "0.2.0"
+description = "NCAT - Nick's Computer-Aided Translation suite, web service edition"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+# Orchestration + web. No torch here: model work is delegated to the
+# .venv-asr / .venv-mt / .venv-llm venvs, which are separate because they
+# need mutually incompatible torch/llama-cpp builds.
+app = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlmodel>=0.0.22",
+    "python-multipart>=0.0.12",
+    "yt-dlp>=2025.1",
+    "httpx>=0.27",
+    "jinja2>=3.1",
+    "websockets>=13",
+    "pillow>=11",
+    "nltk>=3.9",
+]
+
+# tools/ harnesses: ASR eval + reference generation.
+tools = [
+    "jiwer>=3.0",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "numpy>=1.26",
+]
+
+[tool.uv]
+package = false
+
+[tool.setuptools]
+packages = ["pipeline", "backend", "backend.routers"]
+
+[tool.ncat]
+# Model locations. Left empty on purpose: these are per-machine paths and
+# this repository ships the resolution mechanism, not anyone's disk layout.
+# Set them here, or (preferred) via the matching environment variables:
+#
+#   NCAT_ASR_MODEL  NCAT_ALIGNER_MODEL  NCAT_MT_MODEL  NCAT_LLM_MODEL
+#   NCAT_MODELS_ROOT  NCAT_DATA_DIR  NCAT_MT_URL
+#
+# Values must be a local HuggingFace model directory (for the ASR pair) or
+# a path to a .gguf file (for MT). See README.md.
+models_root = ""
+asr_model = ""
+aligner_model = ""
+mt_model = ""
+llm_model = ""

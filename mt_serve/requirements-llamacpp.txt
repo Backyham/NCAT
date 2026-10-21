@@ -1,0 +1,6 @@
+# Backend: llama-cpp-python for GGUF (Q4/Q5/Q6/Q8).
+# CUDA build. Pin the cu124 index for newer GPUs (Blackwell/Ada).
+# For older GPUs swap cu124 -> cu118 or cu121.
+
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+llama-cpp-python>=0.2.90

@@ -73,6 +73,23 @@ def convert_time(ms):
 				(ms % 60000) / 1000
 			)
 
+# Custom LCS: greedy leftmost position-tracking, not standard backtracking.
+#
+# Why not the textbook "fill dp, then backtrack" approach:
+#   1. We don't actually need the *length* of the LCS. We need a
+#      mapping from each S[i] to some j in T, so we can pull
+#      timestamps from recogWordsWithTime later.
+#   2. ASR output frequently contains stutters / repeated words
+#      (e.g. "i i i want to"). Greedy leftmost assignment naturally
+#      distributes duplicates: the first "i" in T goes to the first
+#      S[i]="i", the second to the second, etc. - so the alignment
+#      does not get bunched up and bump later words out of order.
+#   3. Standard backtrack yields a *valid* alignment but requires
+#      tie-breaking rules. The greedy + LIS pipeline below is
+#      simpler and empirically works for this use case.
+#
+# The j-list returned is NOT guaranteed monotonically increasing.
+# That's intentional - get_lis() filters for monotonicity next.
 def get_lcs(S, T):
 	n = len(S)
 	m = len(T)
@@ -90,6 +107,25 @@ def get_lcs(S, T):
 				)
 	return [a[1] for a in s]
 
+# LIS (Longest Increasing Subsequence) on the j positions.
+#
+# Why this filter is necessary: get_lcs()'s greedy assignment can
+# produce a non-monotonic j sequence when the human translator
+# reorders English words during translation. Without LIS, time
+# mapping would produce a line whose start time is later than its
+# end time, or one word's start time later than the next.
+#
+# Why this is acceptable to drop matches: the human English line in
+# the bilingual ASS is essentially the ASR output re-filled, so
+# heavy reordering is rare. When it does happen, the dropped
+# entries are filled by regularize() below as estimates.
+#
+# Tuple comparison note: each s[i] is (length, j), so s[j] < s[i]
+# is lexicographic (length first, then j). This happens to favor
+# entries with both longer LCS and increasing j, which is what we
+# want for the bilingual re-fill case.
+#
+# Returns a same-length list; dropped entries are ().
 def get_lis(s):
 	#有数字括号在s中位置代表欲匹配文章哪个点与机扒匹配
 	#括号中数字代表与机扒列表中哪个词匹配
@@ -114,6 +150,17 @@ def get_lis(s):
 		ret[last] = (s[last],)
 	return ret
 
+# Fill gaps left by LIS so downstream time-mapping never crashes.
+#
+# LIS produces some () entries where it dropped out-of-order
+# matches. Without filling, the time-mapping loop below would
+# crash on lis[i][0] when lis[i] is empty.
+#
+# Filling strategy: distribute available T-positions across the
+# empty S-entries between two anchors. The filled values are
+# ESTIMATES, not real matches. The downstream time-mapping only
+# uses the first and last words of each line, so the middle
+# (filled or not) only matters if it ends up as a line edge.
 def regularize(lis, tot):
 	n = len(lis)
 	mismatched = []
@@ -546,6 +593,25 @@ Dialogue: 0,0:00:00.00,0:00:08.00,Logo,,0,0,0,,{\\p1\\fscx20\\fscy20\\shad2\\bor
 		lcs = get_lcs(targetWords, recogWords)
 		lis = get_lis(lcs)
 		lis = regularize(lis, len(recogWords))
+		# Line-level time mapping: each mainLine gets
+		# [first-word-s, last-word-e] as its subtitle time range.
+		# The middle words are intentionally NOT stored - output is
+		# ASS lines, not word-level subs. This is robust to small
+		# alignment errors in the middle as long as first and last
+		# words line up.
+		#
+		# setTime(0, 0) is the deliberate "I couldn't align this
+		# line" sentinel. In the output ASS it renders as
+		# 0:00:00.00-0:00:00.00, which is the editor's signal
+		# that this line needs manual timing. Two cases trigger
+		# it:
+		#   1. The first or last English word has no ASR match
+		#      (LIS dropped it, regularize couldn't anchor it).
+		#   2. The matched j index overflows the ASR word list
+		#      (alignment ran past the end of the recognition).
+		# Do NOT silently substitute a placeholder time here -
+		# the 0,0 sentinel is the design's contract with the
+		# human subtitle editor.
 		lineHeadPos = 0
 		lineTailPos = 0
 		lenRecogWords = len(recogWordsWithTime)

@@ -1,0 +1,22 @@
+# Virtual environments (uv)
+.venv*/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Machine provisioning scripts (local only — hardcoded paths and credentials)
+setup.sh
+pget.sh
+
+# Runtime state: SQLite DB, job directories, downloaded media
+data/
+downloads/
+
+# Externally-managed checkouts
+.tools/
+
+# Credentials
+.env
+.env.*
+*.smb_cred

@@ -1,14 +1,10 @@
 """NCAT pipeline stages.
 
-Each stage is independently runnable:
+Every stage is a plain function taking ``(job_id, report, paths, ...)``, and
+``pipeline.runner`` dispatches them by name for the web worker. There is no
+command-line entry point -- see ``paths.py`` for why.
 
-    python -m pipeline.download URL
-    python -m pipeline.transcode VIDEO
-    python -m pipeline.transcribe AUDIO.wav
-    python -m pipeline.render VIDEO ASS
-
-and each is also callable from the web runner with the same semantics. See
-``paths.py`` for the stage order and the job directory layout.
+``paths.py`` holds the stage order and the job directory layout.
 """
 from __future__ import annotations
 

@@ -7,47 +7,22 @@ trying four codecs in order on every invocation.
 """
 from __future__ import annotations
 
-import argparse
-import shutil
 import subprocess
-from functools import lru_cache
 from pathlib import Path
 
+from .encoders import (EncoderError, ffmpeg_available, pick_video_encoder,
+                        select_ffmpeg)
 from .paths import Report, noop_report
 
-# Tried in order. h264_nvenc first because the box has a Tesla P40 and
-# hardware encode frees the CPU for ASR running alongside.
-VIDEO_ENCODERS = ('h264_nvenc', 'h264_qsv', 'h264_amf', 'libx264')
+# Preference order and the encoder probe live in pipeline/encoders.py so the
+# render stage cannot pick a different encoder than this one.
 
 
-class TranscodeError(RuntimeError):
+class TranscodeError(EncoderError):
     pass
 
 
-def ffmpeg_available() -> bool:
-    return shutil.which('ffmpeg') is not None
 
-
-@lru_cache(maxsize=1)
-def pick_video_encoder() -> str:
-    """Return the first usable H.264 encoder, or raise if none work."""
-    if not ffmpeg_available():
-        raise TranscodeError(
-            'ffmpeg not found on PATH. On Arch:  sudo pacman -S ffmpeg'
-        )
-    null = 'NUL' if __import__('os').name == 'nt' else '/dev/null'
-    for encoder in VIDEO_ENCODERS:
-        probe = subprocess.run(
-            ['ffmpeg', '-y', '-f', 'lavfi', '-i', 'nullsrc=s=hd720', '-t', '1',
-             '-c:v', encoder, '-f', 'mp4', null],
-            capture_output=True,
-        )
-        # rc 8 means "no such encoder"; anything else means it initialised.
-        if probe.returncode != 8:
-            return encoder
-    raise TranscodeError(
-        f'no usable H.264 encoder among {VIDEO_ENCODERS}'
-    )
 
 
 def transcode(source: str | Path,
@@ -55,8 +30,16 @@ def transcode(source: str | Path,
               wav: str | Path,
               video_bitrate: str = '1M',
               audio_bitrate: str = '128K',
-              report: Report = noop_report) -> tuple[Path, Path]:
-    """Produce ``proxy`` (720p) and ``wav`` (16 kHz mono) from ``source``."""
+              report: Report = noop_report,
+              audio_only: bool = False) -> tuple[Path | None, Path]:
+    """Produce ``proxy`` (720p) and ``wav`` (16 kHz mono) from ``source``.
+
+    ``audio_only`` skips the proxy and returns ``(None, wav)``. The proxy
+    exists for editor scrubbing and nothing downstream of ASR reads it, so a
+    measurement run has no reason to pay for it. On 4K AV1 that is not a
+    small saving: decoding 87 minutes of 4K60 AV1 to build an artefact that is
+    then ignored costs over an hour of wall clock.
+    """
     source = Path(source)
     if not source.is_file():
         raise TranscodeError(f'source not found: {source}')
@@ -64,18 +47,22 @@ def transcode(source: str | Path,
     proxy = Path(proxy)
     wav = Path(wav)
 
-    encoder = pick_video_encoder()
-    report(f'video encoder: {encoder}')
+    video_cmd = None
+    if not audio_only:
+        encoder = pick_video_encoder(report)
+        report(f'video encoder: {encoder}')
+        video_cmd = [
+            select_ffmpeg(report), '-y', '-i', str(source),
+            '-c:v', encoder, '-b:v', video_bitrate,
+            '-c:a', 'aac', '-b:a', audio_bitrate,
+            '-vf', 'scale=-1:720',
+            str(proxy),
+        ]
+    else:
+        report('audio only: skipping the 720p proxy')
 
-    video_cmd = [
-        'ffmpeg', '-y', '-i', str(source),
-        '-c:v', encoder, '-b:v', video_bitrate,
-        '-c:a', 'aac', '-b:a', audio_bitrate,
-        '-vf', 'scale=-1:720',
-        str(proxy),
-    ]
     audio_cmd = [
-        'ffmpeg', '-y', '-i', str(source),
+        select_ffmpeg(report), '-y', '-i', str(source),
         '-vn', '-c:a', 'pcm_s16le', '-ac', '1', '-ar', '16000',
         str(wav),
     ]
@@ -84,6 +71,8 @@ def transcode(source: str | Path,
         (video_cmd, proxy, 'proxy'),
         (audio_cmd, wav, 'audio'),
     ):
+        if cmd is None:
+            continue
         report(f'transcoding {label}')
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -96,7 +85,7 @@ def transcode(source: str | Path,
         size_mb = target.stat().st_size / 1048576
         report(f'{label} done: {target.name} ({size_mb:.1f} MB)')
 
-    return proxy, wav
+    return (None if video_cmd is None else proxy), wav
 
 
 def transcode_stage(job_id: int,
@@ -113,33 +102,3 @@ def transcode_stage(job_id: int,
         raise ValueError('no source file to transcode')
     paths.require('proxy', 'wav')
     return transcode(source, paths.proxy, paths.wav, report=report)
-
-
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        prog='python -m pipeline.transcode',
-        description='NCAT stage 2/7: 720p proxy + 16 kHz mono WAV.',
-    )
-    p.add_argument('source', help='Source video or audio file')
-    p.add_argument('--out-dir', default=None,
-                   help='Output directory (default: alongside the source)')
-    p.add_argument('--stem', default=None,
-                   help='Output filename stem (default: source filename)')
-    args = p.parse_args(argv)
-
-    src = Path(args.source).expanduser().resolve()
-    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else src.parent
-    stem = args.stem or src.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        transcode(src, out_dir / f'{stem}-720p.mp4', out_dir / f'{stem}.wav',
-                  report=lambda m: print(m, flush=True))
-    except (TranscodeError, subprocess.SubprocessError) as exc:
-        print(f'transcode failed: {exc}')
-        return 1
-    return 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())

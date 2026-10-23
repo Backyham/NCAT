@@ -183,6 +183,7 @@ def build_cues(transcript_json: str | Path,
     for index, ((zh, en), tokens) in enumerate(zip(pairs, line_tokens)):
         start_ms = end_ms = 0
         needs_timing = False
+        asr_text = ''
         if tokens:
             first, last = cursor, cursor + len(tokens) - 1
             head = anchors[first] if first < len(anchors) else -1
@@ -190,6 +191,7 @@ def build_cues(transcript_json: str | Path,
             if head >= 0 and tail >= 0 and head < len(words) and tail < len(words):
                 start_ms = int(words[head]['s'])
                 end_ms = int(words[tail]['e'])
+                asr_text = ' '.join(w['w'] for w in words[head:tail + 1]).strip()
             else:
                 needs_timing = True
             cursor = last + 1
@@ -199,6 +201,12 @@ def build_cues(transcript_json: str | Path,
             'end_ms': end_ms,
             'zh': zh,
             'en': en,
+            # What the recogniser actually heard for this line, sliced out of
+            # the same anchored span. Without this the cue carries only the
+            # human source text, and feeding it to the MT stage would quietly
+            # evaluate the translation of a perfect transcript rather than of
+            # what the pipeline will actually have to translate.
+            'asr_text': asr_text,
             'status': 'draft',
             'needs_timing': needs_timing,
         })

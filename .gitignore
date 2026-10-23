@@ -1,17 +1,41 @@
 # Virtual environments (uv)
 .venv*/
+.kilo/
 
 # Python bytecode
 __pycache__/
 *.py[cod]
 
 # Machine provisioning scripts (local only — hardcoded paths and credentials)
-setup.sh
+setup*.sh
 pget.sh
+deploy/*.service
+deploy/*.socket
 
 # Runtime state: SQLite DB, job directories, downloaded media
 data/
 downloads/
+
+# Ground Truth source material and evaluation output (large, per-machine)
+GT/
+eval_out/
+
+# Evaluation harness. These measure a specific set of Ground Truth videos
+# against a specific set of models on specific hardware; the methodology does
+# not generalise, so the tree does not carry it. Kept locally and gitignored.
+# tools/check_ui.py is deliberately NOT ignored: it guards the UI's
+# JavaScript against syntax errors that fail silently, which is a property of
+# this repository rather than of any evaluation.
+tools/*
+!tools/__init__.py
+!tools/check_ui.py
+
+# Vendored third-party bundle, fetched rather than committed.
+# See static/vendor/README.md.
+static/vendor/*.js
+
+# Model weights, copied or mounted locally. Never source control.
+models/
 
 # Externally-managed checkouts
 .tools/
@@ -20,3 +44,6 @@ downloads/
 .env
 .env.*
 *.smb_cred
+
+# Becoming too sensitive to publish
+status.md

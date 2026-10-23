@@ -42,6 +42,15 @@ def subscribe(listener: Listener) -> Callable[[], None]:
     return unsubscribe
 
 
+def announce(job_id: int, payload: dict[str, Any]) -> None:
+    """Publish an event from outside the pipeline.
+
+    HTTP endpoints that mutate job state use this so open browsers stay in
+    step without polling.
+    """
+    _publish(job_id, payload)
+
+
 def _publish(job_id: int, payload: dict[str, Any]) -> None:
     with _lock:
         current = list(_listeners)

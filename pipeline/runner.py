@@ -3,12 +3,12 @@
 ``backend.jobs`` resolves a stage name to a callable and calls it as
 ``fn(job_id=..., report=..., **context)``. The stage modules in this
 package are written to be callable directly with the same signature, so
-this module only has to adapt the few places where the CLI shape differs
-(``download`` takes a URL first, ``transcode`` takes two output paths).
+this module only has to adapt the few places where the argument shape
+differs (``download`` takes a URL, ``transcode`` takes two output paths).
 
 Keeping the adaptation here rather than inside each stage means every stage
-module stays a plain function with named keyword arguments, which is what
-makes ``python -m pipeline.<stage>`` and the web path share code.
+module stays a plain function with named keyword arguments, so the web worker
+and the evaluation harness call them the same way.
 """
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def _resolve(stage: str) -> Callable[..., Any]:
         'download': ('pipeline.download', 'download_stage'),
         'transcode': ('pipeline.transcode', 'transcode_stage'),
         'transcribe': ('pipeline.transcribe', 'transcribe_stage'),
+        'review': ('pipeline.review', 'review_stage'),
         'segment': ('pipeline.segment', 'segment'),
         'translate': ('pipeline.translate', 'translate_cues'),
         'style': ('pipeline.style', 'style_cues'),
@@ -85,7 +86,9 @@ def run_stage(stage: str,
         kwargs['model'] = context.get('mt_model')
         kwargs['terms'] = context.get('terms')
     elif stage == 'render':
-        video = paths.proxy or paths.source
+        # The original, not the 720p proxy: burning from the proxy would
+        # upscale 720p/1 Mbps to 4K. See render_stage for the rationale.
+        video = paths.source or paths.proxy
         if video is None or not Path(video).is_file():
             report('no video to render; skipped')
             return {'skipped': True}

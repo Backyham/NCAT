@@ -143,4 +143,9 @@ def index() -> HTMLResponse:
 
 
 if STATIC_DIR.is_dir():
-    app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
+    # Mounted at the root, not under /static, so the page can use ordinary
+    # relative paths (`css/app.css`) and the tree can be opened from the
+    # filesystem without rewriting anything. Registered API routes are
+    # matched before a mount, so /api and /health are unaffected.
+    app.mount('/', StaticFiles(directory=str(STATIC_DIR), html=True),
+              name='static')

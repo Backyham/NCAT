@@ -7,7 +7,7 @@ progress and writing wherever the process happened to be standing.
 """
 from __future__ import annotations
 
-import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -16,9 +16,26 @@ from .paths import Report, noop_report
 DEFAULT_OUTPUT_DIR = './downloads'
 
 
+def default_proxy() -> str | None:
+    """Proxy from the environment, if one is set.
+
+    yt-dlp does read http_proxy/https_proxy, but only after its own
+    connection setup has already happened, which is late enough to fail on
+    hosts that need the proxy for reachability at all. Passing 'proxy'
+    explicitly makes the request path deterministic.
+    """
+    for var in ('https_proxy', 'HTTPS_PROXY', 'http_proxy', 'HTTP_PROXY'):
+        val = os.environ.get(var)
+        if val:
+            return val
+    return None
+
+
 def download_opts(output_dir: str | Path,
                   cookies_from_browser: str | None = None,
-                  audio_only: bool = False) -> dict:
+                  audio_only: bool = False,
+                  max_height: int | None = None,
+                  proxy: str | None = None) -> dict:
     out_dir = Path(output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -44,16 +61,24 @@ def download_opts(output_dir: str | Path,
             'preferredquality': '192',
         }]
     else:
+        # Cap the video height when asked. 'bestvideo' alone takes whatever
+        # the site offers, which for a 1080p workflow silently becomes 2160p
+        # and wastes bandwidth and disk on a result that is not wanted.
+        vfilter = 'bestvideo' if max_height is None else f'bestvideo[height<={max_height}]'
         opts['format'] = (
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
-            '(bestvideo[ext=mp4]+bestaudio)/'
-            '(bestvideo+bestaudio)/'
+            f'{vfilter}[ext=mp4]+bestaudio[ext=m4a]/'
+            f'({vfilter}[ext=mp4]+bestaudio)/'
+            f'({vfilter}+bestaudio)/'
             'best'
         )
         opts['merge_output_format'] = 'mp4'
 
     if cookies_from_browser:
         opts['cookiesfrombrowser'] = (cookies_from_browser,)
+
+    effective_proxy = proxy or default_proxy()
+    if effective_proxy:
+        opts['proxy'] = effective_proxy
 
     return opts
 
@@ -62,6 +87,8 @@ def download(url: str,
              output_dir: str | Path = DEFAULT_OUTPUT_DIR,
              cookies_from_browser: str | None = None,
              audio_only: bool = False,
+             max_height: int | None = None,
+             proxy: str | None = None,
              report: Report = noop_report) -> Path:
     try:
         import yt_dlp
@@ -73,8 +100,13 @@ def download(url: str,
 
     report(f'downloading {url}')
     report(f'output dir {Path(output_dir).expanduser().resolve()}')
+    if max_height:
+        report(f'max height {max_height}p')
+    if proxy or default_proxy():
+        report(f'proxy {proxy or default_proxy()}')
 
-    opts = download_opts(output_dir, cookies_from_browser, audio_only)
+    opts = download_opts(output_dir, cookies_from_browser, audio_only,
+                         max_height=max_height, proxy=proxy)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         requested = info.get('requested_downloads') or []
@@ -99,36 +131,9 @@ def download_stage(job_id: int,
                    url: str = '',
                    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
                    audio_only: bool = False,
+                   max_height: int | None = None,
+                   proxy: str | None = None,
                    **_ignored) -> Path:
     """Entry point used by the web runner: returns the downloaded path."""
     return download(url, output_dir=output_dir, audio_only=audio_only,
-                    report=report)
-
-
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        prog='python -m pipeline.download',
-        description='NCAT stage 1/7: download source media via yt-dlp.',
-    )
-    p.add_argument('url', help='Video URL (YouTube, Floatplane, ...)')
-    p.add_argument('--out', default=DEFAULT_OUTPUT_DIR,
-                   help='Output directory (default: ./downloads)')
-    p.add_argument('--cookies-from-browser', default=None,
-                   help='Browser to extract cookies from (chrome, firefox, edge)')
-    p.add_argument('--audio-only', action='store_true',
-                   help='Download bestaudio only and extract to m4a')
-    args = p.parse_args(argv)
-
-    try:
-        path = download(args.url, args.out, args.cookies_from_browser,
-                        audio_only=args.audio_only,
-                        report=lambda m: print(m, flush=True))
-    except Exception as exc:
-        print(f'download failed: {exc}', file=sys.stderr)
-        return 1
-    print(path)
-    return 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+                    max_height=max_height, proxy=proxy, report=report)

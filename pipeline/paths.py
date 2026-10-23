@@ -8,8 +8,13 @@ Two things live here because everything else depends on them:
 
 Every stage is a plain function taking ``(job_id, report, paths, ...)``.
 No stage imports another stage and no stage knows about HTTP, so the same
-code runs three ways: as ``python -m pipeline.<stage>``, from ``main.py``
-on the CLI, and from a FastAPI background thread.
+code serves both the web UI and the offline evaluation harness.
+
+There is deliberately **no command-line entry point**: the tool is a web
+service, and each stage also shells out to ffmpeg, so every invocation of
+interest goes through the browser anyway. Keeping a second entry point meant
+two ways to run a job and two sets of flags that could disagree about what
+the pipeline does.
 """
 from __future__ import annotations
 
@@ -24,6 +29,7 @@ STAGES: tuple[str, ...] = (
     'download',
     'transcode',
     'transcribe',
+    'review',
     'segment',
     'translate',
     'style',
@@ -34,6 +40,7 @@ STAGE_LABELS: dict[str, str] = {
     'download': 'Get media',
     'transcode': 'Prepare media',
     'transcribe': 'Transcribe',
+    'review': 'Review text',
     'segment': 'Segment',
     'translate': 'Translate',
     'style': 'Style',
@@ -45,7 +52,7 @@ Report = Callable[[str], None]
 
 
 def noop_report(_: str) -> None:
-    """Default report sink, for CLI use where stdout is already the log."""
+    """Default report sink: stages still run when no reporter is supplied."""
 
 
 @dataclass
@@ -68,6 +75,15 @@ class JobPaths:
     ass: Path | None = None           # final bilingual ASS
     burned: Path | None = None        # rendered video with subs burned in
     segments_txt: Path | None = None  # human-editable bilingual source
+    # --- review gate -------------------------------------------------------
+    # ASR hands over a continuous transcript. A human corrects the wording
+    # and sets the cue boundaries; that reviewed text -- undivided -- is what
+    # the MT stage sees. The translation comes back continuous too and is
+    # only divided afterwards, against these boundaries.
+    asr_draft_txt: Path | None = None   # what ASR proposed, for review
+    reviewed_txt: Path | None = None   # human-corrected text, MT input
+    reviewed_cues: Path | None = None   # human cue boundaries, char offsets
+    translated_txt: Path | None = None  # continuous MT output
 
     _extra: dict[str, Path] = field(default_factory=dict, repr=False)
 
@@ -86,6 +102,10 @@ class JobPaths:
             ass=r / f'{stem}.ass',
             burned=r / f'{stem}.burned.mp4',
             segments_txt=r / f'{stem}.txt.seg',
+            asr_draft_txt=r / f'{stem}.draft.txt',
+            reviewed_txt=r / f'{stem}.reviewed.txt',
+            reviewed_cues=r / f'{stem}.reviewed.cues.json',
+            translated_txt=r / f'{stem}.translated.txt',
         )
         if source:
             paths.set_source(source)

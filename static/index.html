@@ -4,376 +4,49 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NCAT</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<style>
-  body { font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
-  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-</style>
+<link rel="stylesheet" href="css/app.css">
+<!-- Tailwind, vendored rather than pulled from the CDN. This is a
+     self-hosted service on the LAN, so a stylesheet that has to leave the
+     machine is a dependency that can fail silently and a request that
+     should not exist. The utility classes are available for building out
+     page contents; app.css styles the shell itself. -->
+<script src="vendor/tailwind.js"></script>
 </head>
-<body class="bg-zinc-950 text-zinc-100 min-h-screen">
+<body>
 
-<header class="border-b border-zinc-800 px-6 py-4 flex items-center gap-4">
-  <h1 class="text-lg font-semibold tracking-wide">NCAT</h1>
-  <span class="text-xs text-zinc-500">Computer-Aided Translation</span>
-  <div class="ml-auto text-xs text-zinc-500 mono" id="health">checking…</div>
-</header>
+<div class="shell">
 
-<main class="grid lg:grid-cols-[1fr_1fr] gap-6 p-6 max-w-7xl mx-auto">
-
-  <!-- ------------------------------------------------------------ jobs -- -->
-  <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-5">
-    <h2 class="text-sm font-semibold uppercase tracking-wider text-zinc-400 mb-4">Jobs</h2>
-
-    <div class="space-y-3 mb-6">
-      <input id="job-url" type="text" placeholder="Video URL (YouTube, Floatplane…)"
-             class="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-sm
-                    focus:outline-none focus:border-emerald-500">
-      <div class="flex gap-2">
-        <select id="job-glossary" class="bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-sm flex-1">
-          <option value="">No glossary</option>
-        </select>
-        <button id="job-create"
-                class="bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium
-                       rounded px-4 py-2 disabled:opacity-40">
-          Start
-        </button>
-      </div>
-    </div>
-
-    <div id="job-list" class="space-y-2 max-h-[28rem] overflow-y-auto text-sm"></div>
-  </section>
-
-  <!-- ----------------------------------------------------- stage detail -- -->
-  <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-5">
-    <h2 class="text-sm font-semibold uppercase tracking-wider text-zinc-400 mb-4">Pipeline</h2>
-    <div id="stage-rail" class="space-y-1.5 mb-5"></div>
-    <div id="job-message" class="text-xs text-zinc-400 mono h-16 overflow-y-auto
-                                     bg-zinc-950 rounded p-2 whitespace-pre-wrap"></div>
-    <div id="job-files" class="mt-4 flex flex-wrap gap-2"></div>
-  </section>
-
-  <!-- -------------------------------------------------------- glossary -- -->
-  <section class="bg-zinc-900 border border-zinc-800 rounded-lg p-5 lg:col-span-2">
-    <div class="flex items-center gap-3 mb-4">
-      <h2 class="text-sm font-semibold uppercase tracking-wider text-zinc-400">Glossary</h2>
-      <div class="ml-auto flex gap-2">
-        <input id="glossary-new" placeholder="New glossary name"
-               class="bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm w-48
-                      focus:outline-none focus:border-emerald-500">
-        <button id="glossary-create"
-                class="bg-zinc-700 hover:bg-zinc-600 text-sm rounded px-3 py-1.5">Add</button>
-      </div>
-    </div>
-
-    <div class="flex flex-wrap gap-2 mb-4" id="glossary-tabs"></div>
-
-    <div class="flex gap-2 mb-3">
-      <button id="terms-export"
-              class="text-xs bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded px-3 py-1.5">
-        Export CSV
+  <!-- ------------------------------------------------------------ sidebar -->
+  <nav class="sidebar" id="sidebar" aria-label="Sections">
+    <div class="nav" id="nav"></div>
+    <div class="sidebar-foot">
+      <button class="nav-toggle" id="nav-toggle" aria-expanded="true">
+        <span class="nav-chevron" id="nav-chevron">‹</span>
+        <span class="nav-label">Collapse</span>
       </button>
-      <label class="text-xs bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded px-3 py-1.5 cursor-pointer">
-        Import CSV
-        <input id="terms-import" type="file" accept=".csv" class="hidden">
-      </label>
-      <div class="flex gap-1 ml-auto">
-        <input id="term-source" placeholder="source (en)"
-               class="bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm w-44
-                      focus:outline-none focus:border-emerald-500">
-        <input id="term-target" placeholder="target (zh)"
-               class="bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm w-44
-                      focus:outline-none focus:border-emerald-500">
-        <input id="term-note" placeholder="note"
-               class="bg-zinc-800 border border-zinc-700 rounded px-3 py-1.5 text-sm flex-1
-                      focus:outline-none focus:border-emerald-500">
-        <button id="term-add"
-                class="bg-emerald-600 hover:bg-emerald-500 text-white text-sm rounded px-3 py-1.5">
-          Add term
-        </button>
-      </div>
     </div>
+  </nav>
 
-    <div class="overflow-x-auto max-h-96">
-      <table class="w-full text-sm">
-        <thead class="text-zinc-500 text-xs uppercase tracking-wider">
-          <tr class="border-b border-zinc-800">
-            <th class="text-left py-2 pr-4">source</th>
-            <th class="text-left py-2 pr-4">target</th>
-            <th class="text-left py-2 pr-4">note</th>
-            <th class="text-left py-2 pr-4">used</th>
-            <th class="text-left py-2">confirmed</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="term-rows"></tbody>
-      </table>
-    </div>
-  </section>
-</main>
+  <div class="column">
 
-<script>
-const $ = (id) => document.getElementById(id);
-const api = async (path, opts = {}) => {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...opts,
-  });
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-  return res.status === 204 ? null : res.json();
-};
+    <header class="topbar">
+      <h1 class="brand">NCAT</h1>
+      <span class="brand-sub">Computer-Aided Translation</span>
+      <span class="health" id="health" title="Backend status">checking…</span>
+    </header>
 
-const STAGES = ['download','transcode','transcribe','segment','translate','style','render'];
-const STAGE_LABELS = {
-  download:'Get media', transcode:'Prepare media', transcribe:'Transcribe',
-  segment:'Segment', translate:'Translate', style:'Style', render:'Render',
-};
-const STATUS_STYLE = {
-  done:'bg-emerald-500', running:'bg-amber-400 animate-pulse',
-  error:'bg-rose-500', pending:'bg-zinc-700', skipped:'bg-zinc-600',
-};
+    <main class="content" id="content">
+      <section class="page" data-page="home"></section>
+      <section class="page" data-page="download"></section>
+      <section class="page" data-page="transcribe"></section>
+      <section class="page" data-page="translate"></section>
+      <section class="page" data-page="timeline"></section>
+      <section class="page" data-page="export"></section>
+    </main>
 
-let currentGlossary = null;
-let socket = null;
+  </div><!-- /column -->
+</div><!-- /shell -->
 
-// ------------------------------------------------------------------ health
-async function loadHealth() {
-  try {
-    const h = await api('/health');
-    $('health').textContent = `ok · ${h.jobs_dir}`;
-  } catch {
-    $('health').textContent = 'unreachable';
-  }
-}
-
-// -------------------------------------------------------------------- jobs
-async function loadJobs() {
-  const jobs = await api('/api/jobs');
-  const list = $('job-list');
-  list.innerHTML = '';
-  if (!jobs.length) {
-    list.innerHTML = '<p class="text-zinc-600 text-xs">No jobs yet.</p>';
-    return;
-  }
-  for (const job of jobs) {
-    const row = document.createElement('button');
-    row.className = 'w-full text-left px-3 py-2 rounded bg-zinc-800 hover:bg-zinc-700 ' +
-                    'flex items-center gap-3';
-    const dot = job.status === 'done' ? 'bg-emerald-500'
-              : job.status === 'error' ? 'bg-rose-500'
-              : job.status === 'running' ? 'bg-amber-400 animate-pulse' : 'bg-zinc-600';
-    row.innerHTML = `
-      <span class="w-2 h-2 rounded-full ${dot} shrink-0"></span>
-      <span class="flex-1 truncate">${escapeHtml(job.title || job.source_url)}</span>
-      <span class="text-xs text-zinc-500 mono">${job.status}</span>`;
-    row.onclick = () => selectJob(job.id);
-    list.appendChild(row);
-  }
-}
-
-async function createJob() {
-  const url = $('job-url').value.trim();
-  const glossary_id = $('job-glossary').value || null;
-  const btn = $('job-create');
-  btn.disabled = true;
-  try {
-    const job = await api('/api/jobs', {
-      method: 'POST',
-      body: JSON.stringify({ source_url: url, glossary_id }),
-    });
-    $('job-url').value = '';
-    await loadJobs();
-    selectJob(job.id);
-  } catch (e) {
-    alert('Could not create job: ' + e.message);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function selectJob(id) {
-  const job = await api(`/api/jobs/${id}`);
-  renderRail(job);
-  renderFiles(job);
-  if (socket) socket.close();
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  socket = new WebSocket(`${proto}://${location.host}/ws/jobs/${id}`);
-  socket.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.status === 'snapshot') {
-      // Server-side truth on connect; do not merge with stale local state.
-      window.__lastStages = msg.stages || {};
-      renderRail({ stages: window.__lastStages });
-    } else {
-      applyEvent(id, msg);
-    }
-  };
-  socket.onerror = () => {
-    $('job-message').textContent += '\n[websocket error]';
-  };
-}
-
-function renderRail(job) {
-  const rail = $('stage-rail');
-  rail.innerHTML = '';
-  for (const stage of STAGES) {
-    const info = (job.stages || {})[stage] || {};
-    const status = info.status || 'pending';
-    const div = document.createElement('div');
-    div.className = 'flex items-center gap-3 text-sm';
-    div.innerHTML = `
-      <span class="w-2 h-2 rounded-full ${STATUS_STYLE[status] || STATUS_STYLE.pending}"></span>
-      <span class="flex-1 ${status === 'pending' ? 'text-zinc-600' : ''}">${STAGE_LABELS[stage]}</span>
-      <span class="text-xs text-zinc-500 mono">${status}${info.error ? ' — ' + escapeHtml(info.error) : ''}</span>`;
-    rail.appendChild(div);
-  }
-}
-
-function applyEvent(id, msg) {
-  const job = { stages: msg.stages || {} };
-  if (msg.stages) {
-    // Preserve stages the server did not resend.
-    const keep = { ...(window.__lastStages || {}), ...msg.stages };
-    window.__lastStages = keep;
-    job.stages = keep;
-  }
-  renderRail(job);
-  if (msg.message) $('job-message').textContent += '\n' + msg.message;
-  if (msg.job_status === 'done' || msg.job_status === 'error') {
-    $('job-message').textContent += `\n[${msg.job_status}]`;
-    loadJobs();
-  }
-  if (msg.status === 'error' && msg.traceback) {
-    $('job-message').textContent += '\n' + msg.traceback;
-  }
-}
-
-async function renderFiles(job) {
-  const box = $('job-files');
-  box.innerHTML = '';
-  try {
-    const names = await api(`/api/jobs/${job.id}/files`);
-    for (const name of names) {
-      const a = document.createElement('a');
-      a.href = `/api/jobs/${job.id}/files/${encodeURIComponent(name)}`;
-      a.className = 'text-xs bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded px-2 py-1';
-      a.textContent = name;
-      box.appendChild(a);
-    }
-  } catch { /* job has no directory yet */ }
-}
-
-// ---------------------------------------------------------------- glossary
-async function loadGlossaries() {
-  const items = await api('/api/glossaries');
-  const tabs = $('glossary-tabs');
-  const select = $('job-glossary');
-  const prev = currentGlossary;
-  tabs.innerHTML = '';
-  select.innerHTML = '<option value="">No glossary</option>';
-  for (const g of items) {
-    const b = document.createElement('button');
-    b.className = `text-xs px-3 py-1.5 rounded border ${
-      g.id === currentGlossary
-        ? 'bg-emerald-600 border-emerald-500 text-white'
-        : 'bg-zinc-800 border-zinc-700 hover:bg-zinc-700'}`;
-    b.textContent = g.name;
-    b.onclick = () => { currentGlossary = g.id; loadGlossaries(); loadTerms(); };
-    tabs.appendChild(b);
-
-    const opt = document.createElement('option');
-    opt.value = g.id;
-    opt.textContent = g.name;
-    select.appendChild(opt);
-  }
-  if (!currentGlossary && items.length) currentGlossary = items[0].id;
-  if (prev) select.value = prev;
-  if (currentGlossary) loadTerms();
-}
-
-async function loadTerms() {
-  const rows = $('term-rows');
-  rows.innerHTML = '';
-  if (!currentGlossary) return;
-  const terms = await api(`/api/glossaries/${currentGlossary}/terms`);
-  for (const t of terms) {
-    const tr = document.createElement('tr');
-    tr.className = 'border-b border-zinc-800/60';
-    tr.innerHTML = `
-      <td class="py-1.5 pr-4">${escapeHtml(t.source)}</td>
-      <td class="py-1.5 pr-4 text-emerald-300">${escapeHtml(t.target)}</td>
-      <td class="py-1.5 pr-4 text-zinc-500 text-xs">${escapeHtml(t.note)}</td>
-      <td class="py-1.5 pr-4 text-zinc-500 mono text-xs">${t.usage_count}</td>
-      <td class="py-1.5 pr-4"><input type="checkbox" ${t.confirmed ? 'checked' : ''} class="accent-emerald-500"></td>
-      <td class="py-1.5"><button class="text-rose-400 text-xs">delete</button></td>`;
-
-    const [ , , , , confirmedBox, delBtn] = tr.children;
-    confirmedBox.onchange = async () => {
-      await api(`/api/glossaries/${currentGlossary}/terms/${t.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ confirmed: confirmedBox.checked }),
-      });
-    };
-    delBtn.onclick = async () => {
-      await api(`/api/glossaries/${currentGlossary}/terms/${t.id}`, { method: 'DELETE' });
-      loadTerms();
-    };
-    rows.appendChild(tr);
-  }
-  if (!terms.length) {
-    rows.innerHTML = '<tr><td colspan="6" class="py-3 text-zinc-600 text-xs">No terms yet.</td></tr>';
-  }
-}
-
-async function addTerm() {
-  const source = $('term-source').value.trim();
-  const target = $('term-target').value.trim();
-  if (!source || !target || !currentGlossary) return;
-  await api(`/api/glossaries/${currentGlossary}/terms`, {
-    method: 'POST',
-    body: JSON.stringify({ source, target, note: $('term-note').value.trim() }),
-  });
-  $('term-source').value = $('term-target').value = $('term-note').value = '';
-  loadTerms();
-}
-
-function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-// ------------------------------------------------------------------- wiring
-$('job-create').onclick = createJob;
-$('job-url').addEventListener('keydown', (e) => { if (e.key === 'Enter') createJob(); });
-$('term-add').onclick = addTerm;
-$('glossary-create').onclick = async () => {
-  const name = $('glossary-new').value.trim();
-  if (!name) return;
-  const g = await api('/api/glossaries', { method: 'POST', body: JSON.stringify({ name }) });
-  $('glossary-new').value = '';
-  currentGlossary = g.id;
-  loadGlossaries();
-};
-$('terms-export').onclick = () => {
-  if (currentGlossary) location.href = `/api/glossaries/${currentGlossary}/terms.csv`;
-};
-$('terms-import').onchange = async (e) => {
-  const file = e.target.files[0];
-  if (!file || !currentGlossary) return;
-  const body = new FormData();
-  body.append('file', file);
-  const res = await fetch(`/api/glossaries/${currentGlossary}/terms.csv`, {
-    method: 'POST', body,
-  });
-  const result = await res.json();
-  alert(`added ${result.added}, updated ${result.updated}, skipped ${result.skipped}`);
-  loadTerms();
-  e.target.value = '';
-};
-
-loadHealth();
-loadJobs();
-loadGlossaries();
-setInterval(() => { loadJobs(); }, 10000);
-</script>
+<script type="module" src="js/main.js"></script>
 </body>
 </html>

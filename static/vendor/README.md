@@ -36,9 +36,5 @@ Tailwind 官方明确说明 Play CDN **仅供开发使用**，它在页面加载
 
 ## 校验
 
-`tools/check_ui.py` 会解析 `static/js/` 下的每个 JS 文件，**不包含**本目录（第三方代码
-不归本项目维护）。
-
-```bash
-python -m tools.check_ui
-```
+当前 Web UI 是纯空壳，没有 `static/js/` 文件，也没有前端校验脚本。重建 UI 时再补。
+本目录是第三方代码，不归本项目维护。

@@ -1,52 +1,48 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NCAT</title>
 <link rel="stylesheet" href="css/app.css">
-<!-- Tailwind, vendored rather than pulled from the CDN. This is a
-     self-hosted service on the LAN, so a stylesheet that has to leave the
-     machine is a dependency that can fail silently and a request that
-     should not exist. The utility classes are available for building out
-     page contents; app.css styles the shell itself. -->
 <script src="vendor/tailwind.js"></script>
 </head>
 <body>
 
 <div class="shell">
 
-  <!-- ------------------------------------------------------------ sidebar -->
-  <nav class="sidebar" id="sidebar" aria-label="Sections">
-    <div class="nav" id="nav"></div>
-    <div class="sidebar-foot">
-      <button class="nav-toggle" id="nav-toggle" aria-expanded="true">
-        <span class="nav-chevron" id="nav-chevron">‹</span>
-        <span class="nav-label">Collapse</span>
-      </button>
+  <nav class="sidebar" aria-label="功能导航">
+    <div class="nav">
+      <div class="nav-group">
+        <div class="nav-group-label">CLI baseline</div>
+        <span class="nav-item is-active">NCAT</span>
+      </div>
+      <div class="nav-group">
+        <div class="nav-group-label">Web UI</div>
+        <span class="nav-item">空壳</span>
+      </div>
     </div>
   </nav>
 
   <div class="column">
-
     <header class="topbar">
       <h1 class="brand">NCAT</h1>
-      <span class="brand-sub">Computer-Aided Translation</span>
-      <span class="health" id="health" title="Backend status">checking…</span>
+      <span class="brand-sub">计算机辅助翻译</span>
+      <span class="health">CLI baseline</span>
     </header>
 
-    <main class="content" id="content">
-      <section class="page" data-page="home"></section>
-      <section class="page" data-page="download"></section>
-      <section class="page" data-page="transcribe"></section>
-      <section class="page" data-page="translate"></section>
-      <section class="page" data-page="timeline"></section>
-      <section class="page" data-page="export"></section>
+    <main class="content">
+      <section class="page is-active" data-page="home">
+        <h2>CLI baseline</h2>
+        <p>当前代码库已回滚到 commit <code>6397165</code> 的 CLI 流水线。Web UI 只保留
+          Tailwind 外壳，不包含任何功能页面或后端。</p>
+        <pre><code>python main.py</code></pre>
+        <p>重建方案与执行计划见 <code>docs/</code>。</p>
+      </section>
     </main>
+  </div>
 
-  </div><!-- /column -->
-</div><!-- /shell -->
+</div>
 
-<script type="module" src="js/main.js"></script>
 </body>
 </html>

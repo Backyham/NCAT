@@ -68,6 +68,22 @@ html, body {
 
 .nav { padding: 0.75rem; display: flex; flex-direction: column; gap: 2px; }
 
+/* Group headings separate the stages of the work: what has to happen
+   before the translation, the translation itself, and the rendering. */
+.nav-group { display: flex; flex-direction: column; gap: 2px; margin-bottom: 0.75rem; }
+.nav-group:last-child { margin-bottom: 0; }
+
+.nav-group-label {
+  padding: 0.5rem 0.625rem 0.25rem;
+  color: var(--faint);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sidebar.is-collapsed .nav-group-label { display: none; }
+.sidebar.is-collapsed .nav-group { margin-bottom: 0.5rem; }
+
 .nav-item {
   display: flex;
   align-items: center;
@@ -148,3 +164,174 @@ html, body {
 
 .empty h2 { margin: 0 0 0.5rem; font-size: 0.95rem; font-weight: 600; color: var(--muted); }
 .empty p  { margin: 0; font-size: 13px; }
+
+/* ---------------------------------------------------------------- glossary */
+
+.glossary { display: flex; flex-direction: column; gap: 0.75rem; }
+
+/* Three stacked bars: pick and move a glossary, search inside it, add a
+   pair to it. Each is a row of its own so the controls keep their order
+   however narrow the window gets. */
+.glossary-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.glossary-bar-actions { display: flex; align-items: center; gap: 0.5rem; margin-left: auto; }
+
+.glossary-field { display: flex; flex-direction: column; gap: 0.25rem; min-width: 10rem; }
+.glossary-field-glossary { min-width: 16rem; }
+.glossary-field-grow { flex: 1 1 20rem; }
+.glossary-field-type { min-width: 7rem; }
+.glossary-field > span { font-size: 11px; color: var(--faint); letter-spacing: 0.04em; }
+
+.glossary-field select,
+.glossary-field input {
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+}
+.glossary-field select:focus-visible,
+.glossary-field input:focus-visible { outline: 2px solid var(--accent-dim); outline-offset: 1px; }
+
+.glossary-add { align-items: flex-end; }
+.glossary-add .glossary-field { flex: 1 1 12rem; }
+.glossary-add .btn { align-self: flex-end; }
+
+.glossary-arrow { color: var(--faint); padding-bottom: 0.45rem; font-size: 14px; }
+
+.btn {
+  padding: 0.375rem 0.75rem;
+  border: 1px solid var(--accent-dim);
+  border-radius: 6px;
+  background: var(--accent-dim);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--accent); border-color: var(--accent); color: #04211a; }
+.btn-quiet { background: transparent; border-color: var(--line); color: var(--muted); }
+.btn-quiet:hover { background: var(--panel-hover); border-color: var(--muted); color: var(--text); }
+.btn-danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+.btn-danger:hover { background: var(--danger); border-color: var(--danger); color: #2a0a10; }
+
+.glossary-status {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  font-size: 12px;
+  color: var(--faint);
+}
+.glossary-message { color: var(--accent); }
+.glossary-message.is-error { color: var(--danger); }
+
+/* Two pairs per row: a glossary is a long list of short entries, and the
+   four-column layout fits twice as many without the pairs drifting apart. */
+.glossary-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  table-layout: fixed;
+}
+.glossary-table th {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.glossary-table td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+.glossary-table tbody tr:hover td { background: var(--panel-hover); }
+
+/* The pair separator: without it the eye runs a target into the next
+   source and reads them as one phrase. */
+.glossary-table td:nth-child(2) { border-right: 1px solid var(--line); color: var(--text); }
+.glossary-table td:nth-child(1),
+.glossary-table td:nth-child(3) { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.glossary-table td:nth-child(4) { color: var(--text); }
+
+/* A cell that holds a term is clickable; the cursor says so. */
+.glossary-cell { cursor: pointer; }
+.glossary-cell:hover { color: var(--accent); }
+
+.glossary-pair-empty { border-right: 1px solid var(--line); }
+.glossary-empty { color: var(--faint); text-align: center; padding: 2.5rem 0.75rem; }
+
+.glossary-type {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0 0.3rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--faint);
+  font-family: var(--sans);
+  font-size: 10px;
+  vertical-align: super;
+}
+
+.glossary-unconfirmed {
+  display: inline-block;
+  margin-left: 0.35rem;
+  padding: 0 0.3rem;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  color: var(--warn);
+  font-size: 10px;
+  vertical-align: super;
+}
+
+/* ------------------------------------------------------------------ modal */
+
+.glossary-modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  padding: 1.5rem;
+  z-index: 40;
+}
+.glossary-modal[hidden] { display: none; }
+
+.glossary-modal-box {
+  width: min(46rem, 100%);
+  padding: 1.25rem 1.5rem 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.glossary-modal-box h3 { margin: 0 0 1rem; font-size: 0.95rem; font-weight: 600; }
+
+.glossary-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--line-soft);
+}
+.glossary-add-row .glossary-field { flex: 1 1 12rem; }
+
+.glossary-modal-actions { display: flex; align-items: center; gap: 0.5rem; padding-top: 1rem; }
+.glossary-modal-gap { flex: 1; }

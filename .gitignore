@@ -1,49 +1,51 @@
-# Virtual environments (uv)
+# Virtual environments and local toolchains
 .venv*/
+.tools/
 .kilo/
 
 # Python bytecode
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
 
-# Machine provisioning scripts (local only — hardcoded paths and credentials)
-setup*.sh
-pget.sh
-deploy/*.service
-deploy/*.socket
-
-# Runtime state: SQLite DB, job directories, downloaded media
+# Runtime state and generated corpora
 data/
 downloads/
-
-# Ground Truth source material and evaluation output (large, per-machine)
-GT/
 eval_out/
+corpus/
+*.log
 
-# Evaluation harness. These measure a specific set of Ground Truth videos
-# against a specific set of models on specific hardware; the methodology does
-# not generalise, so the tree does not carry it. Kept locally and gitignored.
-# tools/check_ui.py is deliberately NOT ignored: it guards the UI's
-# JavaScript against syntax errors that fail silently, which is a property of
-# this repository rather than of any evaluation.
-tools/*
-!tools/__init__.py
-!tools/check_ui.py
+# Ground Truth media and subtitle sources (large, per-machine)
+GT/
+
+# Documents - Do not remove, might contain sensitive materials that should not be committed
+docs/
+
+# Test scripts - build tools, no need to commit
+tests/
+
+# Legacy CLI restored from 6397165; local behavior reference only, not shipped.
+legacy/
+
+# Model weights and local model directories
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
 
 # Vendored third-party bundle, fetched rather than committed.
 # See static/vendor/README.md.
 static/vendor/*.js
 
-# Model weights, copied or mounted locally. Never source control.
-models/
+# Frontend build toolchain; web/dist is produced at release time.
+node_modules/
+web/dist/
+.vite/
 
-# Externally-managed checkouts
-.tools/
-
-# Credentials
-.env
-.env.*
-*.smb_cred
-
-# Becoming too sensitive to publish
-status.md
+# Machine-provisioning scripts (local only)
+setup*.sh
+pget.sh

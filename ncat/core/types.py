@@ -189,6 +189,7 @@ class Word:
     normalized: str = ""
     confidence: float | None = None
     speaker: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -200,8 +201,11 @@ class Transcript:
     text: str = ""
     words: list[Word] = field(default_factory=list)
     segments: list[dict[str, Any]] = field(default_factory=list)
+    chunks: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: int | None = None
     created_at: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

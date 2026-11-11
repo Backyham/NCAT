@@ -35,10 +35,11 @@ class ProjectPaths:
     segments: Path
     cues: Path
     qa: Path
+    index: Path
 
     @classmethod
     def for_root(cls, root: str | Path) -> "ProjectPaths":
-        root = Path(root)
+        root = Path(root).expanduser().resolve()
         return cls(
             root=root,
             project_file=root / PROJECT_FILE,
@@ -50,6 +51,7 @@ class ProjectPaths:
             segments=root / "segments.jsonl",
             cues=root / "cues.jsonl",
             qa=root / "qa.jsonl",
+            index=root / "index.db",
         )
 
     def create(self) -> None:
@@ -65,6 +67,7 @@ class ProjectState:
     project: Project
     source: Source | None
     asr: dict = field(default_factory=dict)
+    ingest: dict = field(default_factory=dict)
     paths: ProjectPaths | None = None
 
     def to_payload(self) -> dict:
@@ -73,6 +76,7 @@ class ProjectState:
             "project": asdict(self.project),
             "source": asdict(self.source) if self.source else None,
             "asr": self.asr,
+            "ingest": self.ingest,
         }
 
 
@@ -115,7 +119,8 @@ def load_project(root: str | Path) -> ProjectState:
     project = Project(**payload["project"])
     source = Source(**payload["source"]) if payload.get("source") else None
     return ProjectState(project=project, source=source,
-                        asr=payload.get("asr", {}), paths=paths)
+                        asr=payload.get("asr", {}),
+                        ingest=payload.get("ingest", {}), paths=paths)
 
 
 def _atomic_write(path: Path, text: str) -> None:

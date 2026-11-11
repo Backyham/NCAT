@@ -108,8 +108,9 @@ def parse_ass(source: str | Path) -> AssDocument:
                     part.strip() for part in line.split(":", 1)[1].split(",")
                 ]
             elif line.startswith("Style:"):
-                values = _split_fields(line.split(":", 1)[1].lstrip(","),
-                                       len(document.style_format))
+                values = [part.strip() for part in _split_fields(
+                    line.split(":", 1)[1].lstrip(","),
+                    len(document.style_format))]
                 data = dict(zip(document.style_format, values))
                 document.styles.append(AssStyle(
                     name=data.get("Name", ""), fields=data))

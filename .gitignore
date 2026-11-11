@@ -25,6 +25,9 @@ docs/
 # Test scripts - build tools, no need to commit
 tests/
 
+# Local ASR backend scripts (not shipped)
+ncat/test/
+
 # Legacy CLI restored from 6397165; local behavior reference only, not shipped.
 legacy/
 

@@ -6,6 +6,7 @@ and never writes a dangling ffmpeg option.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -22,6 +23,7 @@ VIDEO_ENCODERS: tuple[str, ...] = (
     "h264_nvenc",
     "h264_qsv",
     "h264_amf",
+    "h264_videotoolbox",
     "libx264",
 )
 
@@ -68,6 +70,15 @@ def ffmpeg_available() -> bool:
 def ffprobe_available() -> bool:
     binary = ffprobe_bin()
     return bool(shutil.which(binary) or Path(binary).is_file())
+
+
+def file_checksum(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    """SHA-256 of a file, streamed so large videos are not loaded into RAM."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _fps(value: str | None) -> float | None:
@@ -251,7 +262,66 @@ def transcode_source(source: str | Path, output_dir: str | Path, *,
     wav = output_dir / f"{stem}.wav"
     info = probe_media(source)
     chosen = encoder or pick_video_encoder(ffmpeg)
-    _run(build_proxy_command(source, proxy, encoder=chosen, height=height,
-                             ffmpeg=ffmpeg), "video transcode")
-    _run(build_audio_command(source, wav, ffmpeg=ffmpeg), "audio transcode")
+
+    temporary = Path(tempfile.mkdtemp(prefix=".ncat-", dir=output_dir))
+    try:
+        temporary_proxy = temporary / proxy.name
+        temporary_wav = temporary / wav.name
+        _run(build_proxy_command(source, temporary_proxy, encoder=chosen,
+                                 height=height, ffmpeg=ffmpeg),
+             "video transcode")
+        _run(build_audio_command(source, temporary_wav, ffmpeg=ffmpeg),
+             "audio transcode")
+        os.replace(temporary_proxy, proxy)
+        os.replace(temporary_wav, wav)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
     return TranscodeResult(info=info, proxy=proxy, wav=wav, encoder=chosen)
+
+
+def _escape_filter_path(path: str | Path) -> str:
+    value = str(Path(path).resolve())
+    value = value.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    return f"'{value}'"
+
+
+def build_burn_command(source: str | Path, ass: str | Path,
+                       output: str | Path, *,
+                       preset: str = "original",
+                       encoder: str = "libx264",
+                       crf: int = 20,
+                       ffmpeg: str | None = None) -> list[str]:
+    filters = [f"subtitles={_escape_filter_path(ass)}"]
+    if preset == "youtube_1080p":
+        filters.append("scale=-2:1080")
+    elif preset == "bilibili_2160p":
+        filters.append("scale=-2:2160")
+    quality = (["-rc", "vbr", "-cq", str(crf), "-b:v", "0"]
+               if "nvenc" in encoder else
+               ["-crf", str(crf), "-preset", "medium"])
+    return [
+        ffmpeg or ffmpeg_bin(),
+        "-y", "-v", "error",
+        "-i", str(source),
+        "-vf", ",".join(filters),
+        "-c:v", encoder,
+        *quality,
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(output),
+    ]
+
+
+def render_subtitles(source: str | Path, ass: str | Path,
+                     output: str | Path, **kwargs) -> Path:
+    source, ass, output = Path(source), Path(ass), Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.stem + ".partial" + output.suffix)
+    command = build_burn_command(source, ass, temporary, **kwargs)
+    try:
+        _run(command, "subtitle render")
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return output

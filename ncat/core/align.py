@@ -147,3 +147,26 @@ def align_cues(cues: Sequence[Cue], words: Sequence[Word], *,
             needs_timing=False,
         ))
     return alignments
+
+
+def apply_alignments(cues: Sequence[Cue],
+                     alignments: Sequence[Alignment]) -> list[Cue]:
+    """Copy alignment results onto cues without dropping unmatched cues."""
+    by_id = {alignment.cue_id: alignment for alignment in alignments}
+    result: list[Cue] = []
+    for cue in cues:
+        alignment = by_id.get(cue.id)
+        if alignment is not None:
+            cue.start_ms = alignment.start_ms
+            cue.end_ms = alignment.end_ms
+            cue.needs_timing = alignment.needs_timing
+            cue.timing_confidence = alignment.confidence
+            cue.alignment_method = alignment.method
+        result.append(cue)
+    return result
+
+
+def align_cues_to_words(cues: Sequence[Cue],
+                        words: Sequence[Word], *,
+                        method: str = "lcs_lis_regularize") -> list[Cue]:
+    return apply_alignments(cues, align_cues(cues, words, method=method))

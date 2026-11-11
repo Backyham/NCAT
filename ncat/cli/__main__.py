@@ -2,16 +2,61 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from ncat import __version__
-from ncat.core.asr import ASRRequest, available_backends, get_backend
-from ncat.core.media import transcode_source
-from ncat.core.project import (
-    create_project, load_project, save_project,
+from ncat.core.align import align_cues_to_words
+from ncat.core.assets.tm import (
+    find_matches, read_tmx, read_units, write_tmx, write_units,
 )
-from ncat.core.transcript import save_transcript
+from ncat.core.assets.termbase import (
+    import_table, match_terms, read_terms, read_tbx, write_tbx, write_terms,
+)
+from ncat.core.corpus import build_and_write
+from ncat.core.mt import get_backend as get_mt_backend
+from ncat.core.mt.base import MTRequest, SegmentInput
+from ncat.core.qa import read_qa, run_qa, update_qa, write_qa
+from ncat.core.workspace import (
+    effective_terms, effective_tm, find_workspace_for, subproject_state,
+)
+from ncat.core.asr import (
+    ASRRequest, describe_backends, get_backend, load_plugins,
+)
+from ncat.core.asr.base import ASRError
+from ncat.core.index import build_index, search_index
+from ncat.core.media import (
+    MediaError, file_checksum, probe_media, render_subtitles,
+    transcode_source,
+)
+from ncat.core.project import (
+    create_project, load_project, new_id, read_cues, read_segments,
+    save_project, write_cues, write_segments,
+)
+from ncat.core.segment import (
+    load_bilingual_pair, read_lines, segments_from_pairs,
+    segments_from_source_text, segments_from_transcript,
+)
+from ncat.core.subs.model import (
+    cues_from_segments, export_ass, merge_cues, split_bilingual_text,
+    split_cue,
+)
+from ncat.core.subs.rules import apply_all
+from ncat.core.runs import (
+    fail_run, finish_run, finish_step, latest_run, new_run, save_run,
+    start_step,
+)
+from ncat.core.text import source_hash
+from ncat.core.transcript import (
+    apply_offset, finalize_transcript, load_transcript, save_transcript,
+    write_transcript_text,
+)
+from ncat.core.types import (
+    Cue, ProjectStage, QAStatus, RunStatus, SegmentStatus, StepStatus,
+)
 
 COMMANDS = [
     ("init", "create a project"),
@@ -28,15 +73,89 @@ COMMANDS = [
     ("term", "term-base commands"),
     ("corpus", "mine TM/terms/test data"),
     ("reindex", "rebuild the local index"),
+    ("serve", "start the local Web editor"),
     ("status", "show project status"),
 ]
+
+
+class CLIError(Exception):
+    def __init__(self, code: str, message: str, *,
+                 fields: dict[str, Any] | None = None,
+                 exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.fields = fields
+        self.exit_code = exit_code
+
+
+def _json_mode(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "json", False))
+
+
+def _emit(args: argparse.Namespace, payload: dict[str, Any],
+          lines: list[str]) -> None:
+    if _json_mode(args):
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    for line in lines:
+        print(line)
+
+
+def _emit_error(args: argparse.Namespace, code: str, message: str,
+                fields: dict[str, Any] | None = None) -> None:
+    if _json_mode(args):
+        error: dict[str, Any] = {"code": code, "message": message}
+        if fields:
+            error["fields"] = fields
+        print(json.dumps({"error": error}, ensure_ascii=False, sort_keys=True),
+              file=sys.stderr)
+        return
+    print(f"ncat: {message}", file=sys.stderr)
+
+
+def _parse_options(values: list[str] | None) -> dict[str, Any]:
+    """Parse repeatable ``KEY=VALUE`` backend options, JSON-coercing values."""
+    options: dict[str, Any] = {}
+    for raw in values or []:
+        if "=" not in raw:
+            raise CLIError(
+                "invalid_argument",
+                f"--option expects KEY=VALUE, got {raw!r}",
+            )
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise CLIError("invalid_argument",
+                           f"--option has an empty key: {raw!r}")
+        try:
+            options[key] = json.loads(value)
+        except json.JSONDecodeError:
+            options[key] = value
+    return options
+
+
+def _begin_run(state, recipe: str):
+    run = new_run(state.project.id, recipe=recipe)
+    save_run(state.paths, run)
+    return run
+
+
+def _fail_run(state, run, error: Exception) -> None:
+    fail_run(run, str(error))
+    save_run(state.paths, run)
+
+
+def _pause_requested(args: argparse.Namespace, state) -> bool:
+    if args.pause_after_transcript is None:
+        return state.project.pause_for_transcript_review
+    return bool(args.pause_after_transcript)
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
     source = Path(args.source).expanduser() if args.source else None
     if source is not None and not source.is_file():
-        print(f"source not found: {source}", file=sys.stderr)
-        return 2
+        raise CLIError("not_found", f"source not found: {source}")
     state = create_project(
         args.path,
         args.name or Path(args.path).name,
@@ -45,87 +164,802 @@ def _cmd_init(args: argparse.Namespace) -> int:
         target_langs=args.target or ["zh-Hans"],
         force=args.force,
     )
-    print(f"created {state.paths.project_file}")
-    print(f"project {state.project.id} ({state.project.name})")
+    if args.pause_after_transcript is not None:
+        state.project.pause_for_transcript_review = args.pause_after_transcript
+        save_project(state)
+    payload = {
+        "project": state.project.id,
+        "name": state.project.name,
+        "path": str(state.paths.project_file),
+        "source": state.source.path if state.source else None,
+        "source_lang": state.project.source_lang,
+        "target_langs": state.project.target_langs,
+        "pause_for_transcript_review":
+            state.project.pause_for_transcript_review,
+    }
+    _emit(args, payload, [
+        f"created {state.paths.project_file}",
+        f"project {state.project.id} ({state.project.name})",
+    ])
     return 0
 
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
     state = load_project(args.project)
     if state.source is None or not state.source.path:
-        print("project has no source; run init --source", file=sys.stderr)
-        return 2
+        raise CLIError("missing_source",
+                       "project has no source; run init --source")
     source = Path(state.source.path)
     if not source.is_file():
-        print(f"source not found: {source}", file=sys.stderr)
-        return 2
-    result = transcode_source(
-        source, state.paths.media, stem="source",
-        height=args.height, encoder=args.encoder,
-    )
-    state.source.proxy_path = str(result.proxy)
-    state.source.audio_path = str(result.wav)
-    state.source.duration_ms = result.info.duration_ms
-    state.source.width = result.info.width
-    state.source.height = result.info.height
-    state.source.fps = result.info.fps
-    state.source.status = "ready"
-    save_project(state)
-    print(f"proxy: {result.proxy}")
-    print(f"audio: {result.wav}")
-    print(f"encoder: {result.encoder}")
-    return 0
+        raise CLIError("not_found", f"source not found: {source}")
+
+    run = _begin_run(state, "ingest")
+    try:
+        step = start_step(run, "checksum")
+        save_run(state.paths, run)
+        checksum = file_checksum(source)
+        finish_step(run, step, StepStatus.SUCCEEDED,
+                    message=checksum, artifacts=[str(source)])
+
+        proxy = state.paths.media / f"source-{args.height}p.mp4"
+        wav = state.paths.media / "source.wav"
+        settings = state.ingest or {}
+        reuse = bool(
+            not args.force
+            and state.source.checksum == checksum
+            and settings.get("height") == args.height
+            and settings.get("encoder")
+            and proxy.is_file()
+            and wav.is_file()
+        )
+        if reuse:
+            step = start_step(run, "reuse")
+            save_run(state.paths, run)
+            info = probe_media(source)
+            encoder = str(settings.get("encoder", ""))
+            finish_step(run, step, StepStatus.SUCCEEDED,
+                        message="checksum and settings match",
+                        artifacts=[str(proxy), str(wav)])
+        else:
+            step = start_step(run, "transcode")
+            save_run(state.paths, run)
+            result = transcode_source(
+                source, state.paths.media, stem="source",
+                height=args.height, encoder=args.encoder,
+            )
+            info = result.info
+            encoder = result.encoder
+            finish_step(run, step, StepStatus.SUCCEEDED,
+                        message=encoder,
+                        artifacts=[str(result.proxy), str(result.wav)])
+
+        state.source.proxy_path = str(proxy)
+        state.source.audio_path = str(wav)
+        state.source.duration_ms = info.duration_ms
+        state.source.width = info.width
+        state.source.height = info.height
+        state.source.fps = info.fps
+        state.source.checksum = checksum
+        state.source.status = "ready"
+        state.ingest = {"height": args.height, "encoder": encoder}
+        save_project(state)
+
+        finish_run(run, RunStatus.SUCCEEDED)
+        save_run(state.paths, run)
+        payload = {
+            "project": state.project.id,
+            "proxy": str(proxy),
+            "audio": str(wav),
+            "encoder": encoder,
+            "reused": reuse,
+            "checksum": checksum,
+            "run_id": run.id,
+            "run_status": str(run.status),
+        }
+        _emit(args, payload, [
+            f"proxy: {proxy}",
+            f"audio: {wav}",
+            f"encoder: {encoder}",
+            f"run: {run.id} ({run.status})",
+        ])
+        return 0
+    except Exception as error:
+        _fail_run(state, run, error)
+        raise
 
 
 def _cmd_transcribe(args: argparse.Namespace) -> int:
+    load_plugins()
+    if args.list_backends:
+        backends = describe_backends()
+        lines = [
+            f"{item['name']}: " + ", ".join(
+                f"{key}={value}" for key, value in item["capabilities"].items()
+                if value not in (False, None, "")
+            )
+            for item in backends
+        ]
+        if not backends and not _json_mode(args):
+            lines.append(
+                "no ASR backends registered; set "
+                "NCAT_ASR_PLUGINS=name=module:factory")
+        _emit(args, {"backends": backends}, lines)
+        return 0
+
+    if not args.project:
+        raise CLIError("invalid_argument",
+                       "transcribe requires a project (or --list-backends)")
+
     state = load_project(args.project)
     if state.source is None or not state.source.audio_path:
-        print("project has no audio; run ingest first", file=sys.stderr)
-        return 2
+        raise CLIError("missing_audio",
+                       "project has no audio; run ingest first")
     audio = Path(state.source.audio_path)
     if not audio.is_file():
-        print(f"audio not found: {audio}", file=sys.stderr)
-        return 2
-    backend = get_backend(args.backend)
-    options = {"source_id": state.source.id}
+        raise CLIError("not_found", f"audio not found: {audio}")
+
+    run = _begin_run(state, "transcribe")
+    try:
+        options = _parse_options(args.option)
+        if args.model and "model" not in options:
+            options["model"] = args.model
+        options.setdefault("source_id", state.source.id)
+        backend_name = args.backend or os.environ.get("NCAT_ASR_BACKEND", "")
+        if not backend_name:
+            raise CLIError(
+                "asr_not_configured",
+                "no ASR backend selected; register a custom backend with "
+                "NCAT_ASR_PLUGINS=name=module:factory and pass --backend name "
+                "(or set NCAT_ASR_BACKEND)",
+            )
+        backend = get_backend(backend_name)
+        language = (args.language or state.source.language
+                    or state.project.source_lang)
+
+        step = start_step(run, "asr")
+        save_run(state.paths, run)
+        transcript = backend.transcribe(ASRRequest(
+            audio_path=str(audio), language=language, options=options,
+        ))
+        finish_step(run, step, StepStatus.SUCCEEDED,
+                    message=f"{len(transcript.words)} words")
+
+        step = start_step(run, "finalize")
+        save_run(state.paths, run)
+        finalize_transcript(
+            transcript, offset_ms=args.offset_ms, chunk_ms=args.chunk_ms,
+        )
+        finish_step(run, step, StepStatus.SUCCEEDED,
+                    message=f"offset={args.offset_ms}ms "
+                            f"chunk={args.chunk_ms}ms")
+
+        step = start_step(run, "write")
+        save_run(state.paths, run)
+        json_path = state.paths.asr / "transcript.json"
+        text_path = state.paths.asr / "transcript.txt"
+        save_transcript(json_path, transcript)
+        write_transcript_text(text_path, transcript)
+        finish_step(run, step, StepStatus.SUCCEEDED,
+                    artifacts=[str(json_path), str(text_path)])
+
+        state.asr = {
+            "backend": transcript.backend,
+            "model": transcript.model,
+            "language": transcript.language,
+            "path": str(json_path),
+            "text_path": str(text_path),
+            "words": len(transcript.words),
+            "chunks": len(transcript.chunks),
+            "offset_ms": args.offset_ms,
+            "chunk_ms": args.chunk_ms,
+            "options": options,
+            "run_id": run.id,
+        }
+        state.project.stage = ProjectStage.DRAFTING
+        save_project(state)
+
+        paused = _pause_requested(args, state)
+        finish_run(run, RunStatus.PAUSED if paused else RunStatus.SUCCEEDED)
+        save_run(state.paths, run)
+        payload = {
+            "project": state.project.id,
+            "backend": transcript.backend,
+            "model": transcript.model,
+            "language": transcript.language,
+            "words": len(transcript.words),
+            "chunks": len(transcript.chunks),
+            "offset_ms": args.offset_ms,
+            "chunk_ms": args.chunk_ms,
+            "json": str(json_path),
+            "text": str(text_path),
+            "run_id": run.id,
+            "run_status": str(run.status),
+        }
+        lines = [
+            f"transcript: {json_path}",
+            f"text: {text_path}",
+            f"words: {len(transcript.words)}",
+            f"run: {run.id} ({run.status})",
+        ]
+        if paused:
+            lines.append("paused for transcript review; "
+                         "use --no-pause-after-transcript to skip")
+        _emit(args, payload, lines)
+        return 0
+    except Exception as error:
+        _fail_run(state, run, error)
+        raise
+
+
+def _cmd_reindex(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    if args.search:
+        result = search_index(state.paths, args.search, limit=args.limit)
+        _emit(args, {"project": state.project.id, "query": args.search,
+                     "results": result}, [str(item) for item in result])
+        return 0
+    status = build_index(state.paths)
+    _emit(args, {
+        "project": state.project.id,
+        "index": status.path,
+        "segments": status.segments,
+        "cues": status.cues,
+        "built_at": status.built_at,
+    }, [f"index: {status.path}", f"segments: {status.segments}",
+        f"cues: {status.cues}"])
+    return 0
+
+
+def _cmd_edit(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    segments = read_segments(state.paths)
+    cues = read_cues(state.paths)
+
+    if args.export_path:
+        lines = [f"{item.source}\t{item.target}"
+                 for item in sorted(segments, key=lambda item: item.order)]
+        Path(args.export_path).expanduser().write_text(
+            "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        _emit(args, {"project": state.project.id,
+                     "export": str(args.export_path), "rows": len(lines)},
+              [f"exported {len(lines)} rows to {args.export_path}"])
+        return 0
+
+    if args.import_path:
+        rows = [line for line in Path(args.import_path).expanduser()
+                .read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        for index, line in enumerate(rows):
+            if index >= len(segments):
+                break
+            source, target = (line.split("\t", 1) + [""])[:2]
+            segments[index].source = source.strip()
+            segments[index].target = target.strip()
+            segments[index].source_hash = source_hash(segments[index].source)
+            segments[index].status = (
+                SegmentStatus.TRANSLATED if segments[index].target
+                else SegmentStatus.EMPTY)
+            segments[index].revision += 1
+        write_segments(state.paths, segments)
+        build_index(state.paths)
+        _emit(args, {"project": state.project.id, "imported": len(rows)},
+              [f"imported {len(rows)} rows"])
+        return 0
+
+    changed = False
+    if args.split_cue:
+        found = next((item for item in cues if item.id == args.split_cue), None)
+        if found is None:
+            raise CLIError("not_found", f"cue not found: {args.split_cue}")
+        left, right = split_cue(found, at_ms=args.at_ms,
+                                ratio=args.ratio)
+        cues = [left if item.id == found.id else item for item in cues]
+        cues.append(right)
+        changed = True
+    if args.merge_cue:
+        first = next((item for item in cues if item.id == args.merge_cue), None)
+        second = next((item for item in cues
+                       if item.id == args.other_cue), None)
+        if first is None or second is None:
+            raise CLIError("not_found", "both --merge-cue and --other-cue "
+                                        "must reference existing cues")
+        merged = merge_cues(first, second)
+        cues = [item for item in cues
+                if item.id not in {first.id, second.id}] + [merged]
+        changed = True
+    if args.insert_cue:
+        index = next((i for i, item in enumerate(cues)
+                      if item.id == args.insert_cue), len(cues) - 1)
+        cue = Cue(
+            id=new_id("cue"),
+            project_id=state.project.id, segment_id=None,
+            order=index + 1 if index >= 0 else len(cues),
+            start_ms=args.start_ms, end_ms=args.end_ms,
+            source_text=args.source_text or "",
+            target_text=args.target_text or "",
+            style=args.style or "Default",
+        )
+        cues.insert(index + 1 if index >= 0 else len(cues), cue)
+        changed = True
+    if args.delete_cue:
+        before = len(cues)
+        cues = [item for item in cues if item.id != args.delete_cue]
+        if len(cues) == before:
+            raise CLIError("not_found", f"cue not found: {args.delete_cue}")
+        changed = True
+    if args.lock_cue:
+        found = next((item for item in cues if item.id == args.lock_cue), None)
+        if found is None:
+            raise CLIError("not_found", f"cue not found: {args.lock_cue}")
+        found.locked = True
+        changed = True
+    if args.unlock_cue:
+        found = next((item for item in cues
+                      if item.id == args.unlock_cue), None)
+        if found is None:
+            raise CLIError("not_found", f"cue not found: {args.unlock_cue}")
+        found.locked = False
+        changed = True
+    if args.segment_status:
+        found = next((item for item in segments
+                      if item.id == args.segment_status), None)
+        if found is None:
+            raise CLIError("not_found",
+                           f"segment not found: {args.segment_status}")
+        try:
+            found.status = SegmentStatus(args.status)
+        except ValueError as exc:
+            raise CLIError("invalid_argument",
+                           f"unknown segment status: {args.status}") from exc
+        found.revision += 1
+        write_segments(state.paths, segments)
+        changed = True
+
+    if changed:
+        for index, cue in enumerate(sorted(cues, key=lambda item: (
+                item.start_ms if item.start_ms is not None else 10**15,
+                item.order))):
+            cue.order = index
+        apply_all(cues)
+        write_cues(state.paths, cues)
+        build_index(state.paths)
+    _emit(args, {"project": state.project.id, "cues": len(cues),
+                 "segments": len(segments), "changed": changed},
+          [f"cues: {len(cues)}", f"segments: {len(segments)}"])
+    return 0
+
+
+def _local_assets(state) -> tuple[list, list]:
+    terms_path = state.paths.assets / "terms.jsonl"
+    tm_path = state.paths.assets / "tm.jsonl"
+    return read_terms(terms_path), read_units(tm_path)
+
+
+def _project_terms_tm(state) -> tuple[list, list]:
+    workspace = find_workspace_for(state.paths.root)
+    if workspace is not None:
+        for subproject in workspace.subprojects:
+            if workspace.subproject_root(subproject) == state.paths.root:
+                return (effective_terms(workspace, subproject),
+                        effective_tm(workspace, subproject))
+    return _local_assets(state)
+
+
+def _cmd_tm(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    path = state.paths.assets / "tm.jsonl"
+    units = read_units(path)
+    if args.import_source:
+        from ncat.core.segment import load_bilingual_pair
+        pairs = load_bilingual_pair(args.import_source, args.import_target)
+        from ncat.core.corpus import units_from_pairs
+        new_units = units_from_pairs(
+            pairs, source_lang=state.project.source_lang,
+            target_lang=(state.project.target_langs[0]
+                         if state.project.target_langs else "zh-Hans"),
+            origin_project=state.project.id)
+        existing = {unit.source_hash for unit in units}
+        units.extend(unit for unit in new_units
+                     if unit.source_hash not in existing)
+        write_units(path, units)
+        _emit(args, {"units": len(units), "added": len(new_units)},
+              [f"TM units: {len(units)}"])
+        return 0
+    if args.export_tmx:
+        write_tmx(units, args.export_tmx)
+        _emit(args, {"units": len(units), "tmx": args.export_tmx},
+              [f"exported {len(units)} units"])
+        return 0
+    if args.match:
+        hits = find_matches(args.match, units, limit=args.limit)
+        _emit(args, {"matches": [hit.__dict__ for hit in hits]},
+              [f"{hit.score:.3f} {hit.match_type} {hit.source}" for hit in hits])
+        return 0
+    _emit(args, {"units": len(units), "path": str(path)},
+          [f"TM units: {len(units)}"])
+    return 0
+
+
+def _cmd_term(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    path = state.paths.assets / "terms.jsonl"
+    terms = read_terms(path)
+    if args.import_path:
+        imported = import_table(
+            args.import_path,
+            source_lang=state.project.source_lang,
+            target_lang=(state.project.target_langs[0]
+                         if state.project.target_langs else "zh-Hans"))
+        existing = {(term.source.casefold(), term.target.casefold())
+                    for term in terms}
+        terms.extend(term for term in imported
+                     if (term.source.casefold(), term.target.casefold())
+                     not in existing)
+        write_terms(path, terms)
+        _emit(args, {"terms": len(terms)}, [f"terms: {len(terms)}"])
+        return 0
+    if args.export_tbx:
+        write_tbx(terms, args.export_tbx)
+        _emit(args, {"terms": len(terms), "tbx": args.export_tbx},
+              [f"exported {len(terms)} terms"])
+        return 0
+    if args.match:
+        hits = match_terms(args.match, terms,
+                           confirmed_only=not args.all_statuses,
+                           limit=args.limit)
+        _emit(args, {"matches": [hit.__dict__ for hit in hits]},
+              [f"{hit.status} {hit.source} -> {hit.target}" for hit in hits])
+        return 0
+    _emit(args, {"terms": len(terms)}, [f"terms: {len(terms)}"])
+    return 0
+
+
+def _cmd_qa(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    terms, _ = _project_terms_tm(state)
+    if args.accept or args.ignore:
+        items = read_qa(state.paths.qa)
+        item_id = args.accept or args.ignore
+        status = QAStatus.ACCEPTED if args.accept else QAStatus.IGNORED
+        update_qa(items, item_id, status)
+        write_qa(state.paths.qa, items)
+        _emit(args, {"updated": item_id, "status": str(status)},
+              [f"QA {item_id}: {status}"])
+        return 0
+    items = run_qa(state.project.id, read_segments(state.paths),
+                   read_cues(state.paths), terms)
+    write_qa(state.paths.qa, items)
+    counts: dict[str, int] = {}
+    for item in items:
+        counts[str(item.severity)] = counts.get(str(item.severity), 0) + 1
+    _emit(args, {"items": len(items), "counts": counts,
+                 "errors": [item.__dict__ for item in items
+                            if str(item.severity) == "error"]},
+          [f"QA items: {len(items)}", str(counts)])
+    return 0
+
+
+def _cmd_corpus(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    result = build_and_write(
+        out=args.out or str(state.paths.assets / "corpus.jsonl"),
+        train=not args.no_train, test_ratio=args.test_ratio,
+        source_path=args.source, target_path=args.target,
+        ass_path=args.ass,
+        source_lang=args.source_lang or state.project.source_lang,
+        target_lang=args.target_lang or (
+            state.project.target_langs[0]
+            if state.project.target_langs else "zh-Hans"),
+        origin_project=state.project.id,
+    )
+    _emit(args, result, [str(result)])
+    return 0
+
+
+def _cmd_translate(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    segments = read_segments(state.paths)
+    if not segments:
+        raise CLIError("missing_segments", "run segment first")
+    terms, tm_units = _project_terms_tm(state)
+    inputs = []
+    selected = segments[:args.limit] if args.limit else segments
+    for index, segment in enumerate(selected):
+        context_before = [item.source for item in
+                          segments[max(0, index - 1):index]]
+        context_after = [item.source for item in
+                         segments[index + 1:index + 2]]
+        inputs.append(SegmentInput(
+            id=segment.id, source=segment.source,
+            context_before=context_before, context_after=context_after,
+            tm_matches=find_matches(segment.source, tm_units),
+            term_hits=match_terms(segment.source, terms),
+        ))
+    backend = get_mt_backend(args.backend or "llama_cpp")
+    options = _parse_options(args.option)
+    if args.base_url:
+        options["base_url"] = args.base_url
     if args.model:
         options["model"] = args.model
-    transcript = backend.transcribe(ASRRequest(
-        audio_path=str(audio),
-        language=args.language or state.source.language
-        or state.project.source_lang,
+    request = MTRequest(
+        source_lang=state.project.source_lang,
+        target_lang=(args.target_lang or
+                     (state.project.target_langs[0]
+                      if state.project.target_langs else "zh-Hans")),
+        segments=inputs,
+        document_brief=args.brief or "",
+        style=args.style or "",
         options=options,
-    ))
-    path = state.paths.asr / "transcript.json"
-    save_transcript(path, transcript)
-    state.asr = {
-        "backend": transcript.backend,
-        "model": transcript.model,
-        "language": transcript.language,
-        "path": str(path),
-        "words": len(transcript.words),
+    )
+    try:
+        result = backend.translate(request)
+    except Exception as exc:
+        raise CLIError("mt_error", str(exc)) from exc
+    by_id = {segment.id: segment for segment in selected}
+    updated = 0
+    term_hits = 0
+    empty = 0
+    echo = 0
+    for target in result.segments:
+        segment = by_id.get(target.id)
+        if segment is None:
+            continue
+        term_hits += len(match_terms(segment.source, terms))
+        if not target.target.strip():
+            empty += 1
+        if target.target.strip() == segment.source.strip():
+            echo += 1
+        if segment.locked or segment.status == SegmentStatus.APPROVED:
+            continue
+        segment.target = target.target
+        segment.status = SegmentStatus.MT_SUGGESTED
+        segment.revision += 1
+        updated += 1
+    write_segments(state.paths, segments)
+    cues = read_cues(state.paths)
+    updated_ids = {segment.id for segment in selected
+                   if segment.id in by_id
+                   and not segment.locked
+                   and segment.status != SegmentStatus.APPROVED}
+    for cue in cues:
+        if cue.locked:
+            continue
+        segment = by_id.get(cue.segment_id)
+        if segment is None and 0 <= cue.order < len(segments):
+            segment = segments[cue.order]
+        if segment is not None and segment.id in updated_ids:
+            cue.target_text = segment.target
+            cue.revision += 1
+    apply_all(cues)
+    write_cues(state.paths, cues)
+    build_index(state.paths)
+    payload = {
+        "project": state.project.id,
+        "provider": result.provider,
+        "model": result.model,
+        "segments": len(result.segments),
+        "updated": updated,
+        "term_hits": term_hits,
+        "empty": empty,
+        "source_echo": echo,
+        "usage": result.usage.__dict__,
     }
+    _emit(args, payload, [str(payload)])
+    return 0
+
+
+def _cmd_segment(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    existing = read_segments(state.paths)
+    if existing and not args.force:
+        raise CLIError("already_exists",
+                       "segments already exist; pass --force to replace")
+
+    if args.propose:
+        transcript_path = state.paths.asr / "transcript.json"
+        if not transcript_path.is_file():
+            raise CLIError("missing_transcript",
+                           "run transcribe before segment --propose")
+        transcript = load_transcript(transcript_path)
+        segments = segments_from_transcript(transcript, state.project.id)
+    elif args.import_path:
+        path = Path(args.import_path).expanduser()
+        if not path.is_file():
+            raise CLIError("not_found", f"import not found: {path}")
+        if args.target:
+            pairs = load_bilingual_pair(path, args.target)
+        else:
+            lines = read_lines(path)
+            pairs = []
+            for line in lines:
+                if "\t" in line:
+                    source, target = line.split("\t", 1)
+                else:
+                    source, target = line, ""
+                pairs.append((source, target))
+        segments = segments_from_pairs(pairs, state.project.id)
+    else:
+        raise CLIError("invalid_argument",
+                       "segment requires --propose or --import PATH")
+
+    write_segments(state.paths, segments)
+    cues = cues_from_segments(segments)
+    apply_all(cues)
+    write_cues(state.paths, cues)
+    state.project.stage = ProjectStage.DRAFTING
     save_project(state)
-    print(f"transcript: {path}")
-    print(f"words: {len(transcript.words)}")
+    payload = {
+        "project": state.project.id,
+        "segments": len(segments),
+        "cues": len(cues),
+    }
+    _emit(args, payload, [
+        f"segments: {len(segments)}",
+        f"cues: {len(cues)}",
+    ])
+    return 0
+
+
+def _cmd_align(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    transcript_path = state.paths.asr / "transcript.json"
+    if not transcript_path.is_file():
+        raise CLIError("missing_transcript",
+                       "run transcribe before align")
+    transcript = load_transcript(transcript_path)
+    if args.offset_ms:
+        apply_offset(transcript, args.offset_ms)
+    cues = read_cues(state.paths)
+    if not cues:
+        segments = read_segments(state.paths)
+        if not segments:
+            raise CLIError("missing_segments",
+                           "run segment before align")
+        cues = cues_from_segments(segments)
+    cues = align_cues_to_words(cues, transcript.words)
+    metrics = apply_all(cues)
+    write_cues(state.paths, cues)
+    state.project.stage = ProjectStage.DRAFTING
+    save_project(state)
+    needs_timing = sum(1 for cue in cues if cue.needs_timing)
+    confidences = [cue.timing_confidence for cue in cues
+                   if cue.timing_confidence is not None]
+    average = sum(confidences) / len(confidences) if confidences else None
+    payload = {
+        "project": state.project.id,
+        "cues": len(cues),
+        "needs_timing": needs_timing,
+        "mean_confidence": None if average is None else round(average, 3),
+        "metrics": metrics,
+    }
+    _emit(args, payload, [
+        f"cues: {len(cues)}",
+        f"needs_timing: {needs_timing}",
+        f"mean_confidence: "
+        + ("-" if average is None else f"{average:.3f}"),
+    ])
+    return 0
+
+
+def _slug(value: str) -> str:
+    return "".join(char if char.isalnum() or char in "-_." else "-"
+                   for char in value).strip("-") or "subtitle"
+
+
+def _cmd_style(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    cues = read_cues(state.paths)
+    if not cues:
+        raise CLIError("missing_cues", "run segment/align first")
+    template = args.template
+    if not template:
+        candidate = state.paths.assets / "template.ass"
+        template = str(candidate) if candidate.is_file() else None
+    output = Path(args.output).expanduser() if args.output else (
+        state.paths.renders / f"{_slug(state.project.name)}.ass")
+    path = export_ass(cues, output, template=template,
+                      bilingual=args.bilingual)
+    payload = {"project": state.project.id, "ass": str(path),
+               "cues": len(cues), "template": template}
+    _emit(args, payload, [f"ass: {path}"])
+    return 0
+
+
+def _cmd_render(args: argparse.Namespace) -> int:
+    state = load_project(args.project)
+    cues = read_cues(state.paths)
+    if not cues:
+        raise CLIError("missing_cues", "run segment/align first")
+    if args.ass:
+        ass = Path(args.ass).expanduser()
+        if not ass.is_file():
+            raise CLIError("not_found", f"ASS not found: {ass}")
+    else:
+        ass = state.paths.renders / f"{_slug(state.project.name)}.ass"
+        if not ass.is_file():
+            template = state.paths.assets / "template.ass"
+            export_ass(cues, ass,
+                       template=str(template) if template.is_file() else None,
+                       bilingual=True)
+    source = (state.source.proxy_path or state.source.path
+              if state.source else None)
+    if not source or not Path(source).is_file():
+        raise CLIError("missing_media",
+                       "no proxy/source; run ingest first")
+    output = Path(args.output).expanduser() if args.output else (
+        state.paths.renders /
+        f"{_slug(state.project.name)}-{args.preset}.mp4")
+    render_subtitles(source, ass, output, preset=args.preset,
+                     encoder=args.encoder, crf=args.crf)
+    payload = {"project": state.project.id, "render": str(output),
+               "ass": str(ass), "preset": args.preset}
+    _emit(args, payload, [f"render: {output}", f"ass: {ass}"])
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        import uvicorn
+        from ncat.api.app import create_app
+    except ImportError as error:
+        raise CLIError(
+            "missing_web_dependency",
+            "install starlette/uvicorn in the web venv: "
+            "uv pip install starlette uvicorn") from error
+    app = create_app(workspace=args.workspace)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
     state = load_project(args.project)
-    print(f"project: {state.project.id}  {state.project.name}")
-    print(f"stage:   {state.project.stage}")
-    print(f"source:  {state.source.path if state.source else '-'}")
+    run = latest_run(state.paths)
+    payload = {
+        "project": state.project.id,
+        "name": state.project.name,
+        "stage": str(state.project.stage),
+        "source": state.source.path if state.source else None,
+        "proxy": state.source.proxy_path if state.source else None,
+        "audio": state.source.audio_path if state.source else None,
+        "asr": state.asr,
+        "ingest": state.ingest,
+        "latest_run": None if run is None else {
+            "id": run.id,
+            "status": str(run.status),
+            "recipe": run.recipe,
+            "steps": [
+                {"name": step.name, "status": str(step.status),
+                 "error": step.error}
+                for step in run.steps
+            ],
+        },
+    }
+    lines = [
+        f"project: {state.project.id}  {state.project.name}",
+        f"stage:   {state.project.stage}",
+        f"source:  {state.source.path if state.source else '-'}",
+    ]
     if state.source:
-        print(f"proxy:   {state.source.proxy_path or '-'}")
-        print(f"audio:   {state.source.audio_path or '-'}")
-    print(f"asr:     {state.asr or '-'}")
+        lines.append(f"proxy:   {state.source.proxy_path or '-'}")
+        lines.append(f"audio:   {state.source.audio_path or '-'}")
+    lines.append(f"asr:     {state.asr or '-'}")
+    if run is not None:
+        lines.append(f"run:     {run.id} ({run.status})")
+        for step in run.steps:
+            suffix = f" - {step.error}" if step.error else ""
+            lines.append(f"  {step.name}: {step.status}{suffix}")
+    _emit(args, payload, lines)
     return 0
 
 
 def _todo(args: argparse.Namespace) -> int:
-    print(f"{args.command}: not implemented yet", file=sys.stderr)
+    message = f"{args.command}: not implemented yet"
+    _emit_error(args, "not_implemented", message)
     return 2
+
+
+def _add_json(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true",
+                        help="emit machine-readable JSON")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,31 +975,186 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--target", action="append",
                       help="target language (repeatable; default zh-Hans)")
     init.add_argument("--force", action="store_true")
+    init.add_argument("--pause-after-transcript",
+                      action=argparse.BooleanOptionalAction, default=None,
+                      help="pause transcript review (default: project setting)")
+    _add_json(init)
     init.set_defaults(func=_cmd_init)
 
     ingest = subparsers.add_parser("ingest", help="transcode proxy/audio")
     ingest.add_argument("project", help="project directory")
     ingest.add_argument("--height", type=int, default=720)
     ingest.add_argument("--encoder", help="h264 encoder; default auto")
+    ingest.add_argument("--force", action="store_true",
+                        help="re-transcode even if the checksum matches")
+    _add_json(ingest)
     ingest.set_defaults(func=_cmd_ingest)
 
     transcribe = subparsers.add_parser("transcribe", help="run ASR")
-    transcribe.add_argument("project", help="project directory")
-    transcribe.add_argument("--backend", default="whisper",
-                            choices=available_backends())
+    transcribe.add_argument("project", nargs="?")
+    transcribe.add_argument("--backend",
+                            default=None,
+                            help="custom backend name from --list-backends "
+                                 "(or NCAT_ASR_BACKEND)")
     transcribe.add_argument("--model")
     transcribe.add_argument("--language")
+    transcribe.add_argument("--option", action="append", metavar="KEY=VALUE",
+                            help="backend-specific option (repeatable)")
+    transcribe.add_argument("--offset-ms", type=int, default=0,
+                            help="global word timestamp offset")
+    transcribe.add_argument("--chunk-ms", type=int, default=0,
+                            help="group words into chunks of this span")
+    transcribe.add_argument("--pause-after-transcript",
+                            action=argparse.BooleanOptionalAction, default=None,
+                            help="pause transcript review (default: project setting)")
+    transcribe.add_argument("--list-backends", action="store_true",
+                            help="show available ASR backends and exit")
+    _add_json(transcribe)
     transcribe.set_defaults(func=_cmd_transcribe)
 
     status = subparsers.add_parser("status", help="show project status")
     status.add_argument("project", help="project directory")
+    _add_json(status)
     status.set_defaults(func=_cmd_status)
 
+    segment = subparsers.add_parser("segment", help="propose/import segments")
+    segment.add_argument("project", help="project directory")
+    segment.add_argument("--propose", action="store_true",
+                         help="create segments from the ASR transcript")
+    segment.add_argument("--import", dest="import_path",
+                         help="bilingual text file (TAB-separated)")
+    segment.add_argument("--target", help="target text file for --import")
+    segment.add_argument("--force", action="store_true")
+    _add_json(segment)
+    segment.set_defaults(func=_cmd_segment)
+
+    align = subparsers.add_parser("align", help="align cues to ASR words")
+    align.add_argument("project", help="project directory")
+    align.add_argument("--offset-ms", type=int, default=0)
+    _add_json(align)
+    align.set_defaults(func=_cmd_align)
+
+    style = subparsers.add_parser("style", help="export ASS")
+    style.add_argument("project", help="project directory")
+    style.add_argument("--template", help="ASS template path")
+    style.add_argument("--output", help="output ASS path")
+    style.add_argument("--bilingual", action=argparse.BooleanOptionalAction,
+                       default=True)
+    _add_json(style)
+    style.set_defaults(func=_cmd_style)
+
+    render = subparsers.add_parser("render", help="burn subtitles")
+    render.add_argument("project", help="project directory")
+    render.add_argument("--ass", help="ASS path (default: export current cues)")
+    render.add_argument("--preset", default="original",
+                        choices=["original", "youtube_1080p",
+                                 "bilibili_2160p"])
+    render.add_argument("--encoder", default="libx264")
+    render.add_argument("--crf", type=int, default=20)
+    render.add_argument("--output", help="output video path")
+    _add_json(render)
+    render.set_defaults(func=_cmd_render)
+
+    translate = subparsers.add_parser(
+        "translate", help="MT/TM/term suggestions")
+    translate.add_argument("project", help="project directory")
+    translate.add_argument("--backend", default="llama_cpp")
+    translate.add_argument("--base-url", help="llama.cpp server base URL")
+    translate.add_argument("--model", default="local")
+    translate.add_argument("--option", action="append", metavar="KEY=VALUE")
+    translate.add_argument("--target-lang")
+    translate.add_argument("--brief")
+    translate.add_argument("--style")
+    translate.add_argument("--limit", type=int, default=0)
+    _add_json(translate)
+    translate.set_defaults(func=_cmd_translate)
+
+    tm = subparsers.add_parser("tm", help="translation-memory commands")
+    tm.add_argument("project", help="project directory")
+    tm.add_argument("--import", dest="import_source")
+    tm.add_argument("--import-target", dest="import_target")
+    tm.add_argument("--export-tmx")
+    tm.add_argument("--match")
+    tm.add_argument("--limit", type=int, default=5)
+    _add_json(tm)
+    tm.set_defaults(func=_cmd_tm)
+
+    term = subparsers.add_parser("term", help="term-base commands")
+    term.add_argument("project", help="project directory")
+    term.add_argument("--import", dest="import_path")
+    term.add_argument("--export-tbx")
+    term.add_argument("--match")
+    term.add_argument("--limit", type=int, default=20)
+    term.add_argument("--all-statuses", action="store_true")
+    _add_json(term)
+    term.set_defaults(func=_cmd_term)
+
+    qa = subparsers.add_parser("qa", help="run QA rules")
+    qa.add_argument("project", help="project directory")
+    qa.add_argument("--accept")
+    qa.add_argument("--ignore")
+    _add_json(qa)
+    qa.set_defaults(func=_cmd_qa)
+
+    corpus = subparsers.add_parser("corpus", help="mine TM/test data")
+    corpus.add_argument("project", help="project directory")
+    corpus.add_argument("--source")
+    corpus.add_argument("--target")
+    corpus.add_argument("--ass")
+    corpus.add_argument("--out")
+    corpus.add_argument("--test-ratio", type=float, default=0.1)
+    corpus.add_argument("--no-train", action="store_true")
+    corpus.add_argument("--source-lang")
+    corpus.add_argument("--target-lang")
+    _add_json(corpus)
+    corpus.set_defaults(func=_cmd_corpus)
+
+    edit = subparsers.add_parser("edit", help="export/import or edit cues")
+    edit.add_argument("project", help="project directory")
+    edit.add_argument("--export", dest="export_path",
+                      help="export segments as source<TAB>target")
+    edit.add_argument("--import", dest="import_path",
+                      help="import segments from source<TAB>target")
+    edit.add_argument("--split-cue", help="split this cue")
+    edit.add_argument("--merge-cue", help="merge this cue with --other-cue")
+    edit.add_argument("--other-cue")
+    edit.add_argument("--insert-cue", help="insert after this cue (or at end)")
+    edit.add_argument("--delete-cue")
+    edit.add_argument("--lock-cue")
+    edit.add_argument("--unlock-cue")
+    edit.add_argument("--segment-status", help="segment id to update")
+    edit.add_argument("--status", help="new segment status")
+    edit.add_argument("--at-ms", type=int)
+    edit.add_argument("--ratio", type=float, default=0.5)
+    edit.add_argument("--start-ms", type=int)
+    edit.add_argument("--end-ms", type=int)
+    edit.add_argument("--source-text", default="")
+    edit.add_argument("--target-text", default="")
+    edit.add_argument("--style", default="Default")
+    _add_json(edit)
+    edit.set_defaults(func=_cmd_edit)
+
+    reindex = subparsers.add_parser("reindex", help="rebuild the local index")
+    reindex.add_argument("project", help="project directory")
+    reindex.add_argument("--search", help="search the index instead of rebuilding")
+    reindex.add_argument("--limit", type=int, default=50)
+    _add_json(reindex)
+    reindex.set_defaults(func=_cmd_reindex)
+
+    serve = subparsers.add_parser("serve", help="start the local Web editor")
+    serve.add_argument("--workspace", help="workspace directory")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.set_defaults(func=_cmd_serve)
+
     for name, help_text in COMMANDS:
-        if name in {"init", "ingest", "transcribe", "status"}:
+        if name in {"init", "ingest", "transcribe", "status", "segment",
+                    "align", "style", "render", "serve", "edit", "reindex",
+                    "translate", "tm", "term", "qa", "corpus"}:
             continue
         command = subparsers.add_parser(name, help=help_text)
         command.add_argument("project", nargs="?")
+        _add_json(command)
         command.set_defaults(func=_todo)
     return parser
 
@@ -178,8 +1167,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         return int(args.func(args))
-    except (OSError, RuntimeError, ValueError) as error:
-        print(f"ncat: {error}", file=sys.stderr)
+    except CLIError as error:
+        _emit_error(args, error.code, error.message, error.fields)
+        return error.exit_code
+    except FileExistsError as error:
+        _emit_error(args, "already_exists", str(error))
+        return 1
+    except FileNotFoundError as error:
+        _emit_error(args, "not_found", str(error))
+        return 1
+    except ASRError as error:
+        _emit_error(args, "asr_error", str(error))
+        return 1
+    except MediaError as error:
+        _emit_error(args, "media_error", str(error))
+        return 1
+    except ValueError as error:
+        _emit_error(args, "invalid_argument", str(error))
+        return 1
+    except OSError as error:
+        _emit_error(args, "io_error", str(error))
         return 1
 
 

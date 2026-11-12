@@ -93,14 +93,21 @@ python -m ncat serve --workspace ~/NCAT --host 127.0.0.1 --port 8765
 
 打开 `http://127.0.0.1:8765`。
 
-- **Home**：NCAT 标题/副标题、New Project、最近项目。
-- 标题栏：`Transcribe`、`Terms`、`TM`、`Settings`。
-- 打开项目后的标签：`Assets`、`Editor`、`Transcript`、`QA`。
-- `New Project` 选项在弹窗内；支持添加子项目。
-- **Terms/TM** 不需要打开项目：可浏览全部数据，并按项目筛选。
+- **Home**：NCAT 标题/副标题、新建项目、最近项目。
+- 标题栏：`转写`、`术语`、`记忆库`、`设置`。
+- 打开项目后的视图：`看板` / `列表`；列表下为 `素材`、`编辑器`、`转写稿`、`样式`、`质检` 标签。
+- **看板**：列是流程阶段（待素材→待转写→待分段→翻译中→待审校→待导出→已交付→已归档），泳道按子项目类型分组，可收起；卡片显示已确认进度、QA 待办、行数、截止日期与手动覆盖标记。拖拽移动：向前直接生效，向回需要填写原因；可筛选卡片、显示/隐藏已归档。
+- **列表**：原有的素材、编辑器、转写稿、样式、质检标签页。
+- **编辑器字幕行**：左侧是状态目录（空 / 机器翻译建议 / 记忆库建议 / 已翻译 / 已审阅 / 已确认 / 已退回 / 绘图），每个状态可展开，点击子任务在右侧主窗格编辑。
+- `新建项目` 选项在弹窗内；支持添加子项目。
+- **Terms/TM** 不需要打开项目：可浏览全部数据，并按项目筛选；记忆库标签支持全文检索与 TMX 导出。
 - **Settings**：ASR/MT 的 local/cloud 模式，以及各自 API Key；不配置模型或 endpoint。
-- **Health**：右上角气泡，显示 CPU/GPU/RAM/Disk 与 ASR/MT 服务状态。
+- **Health**：右上角气泡，只显示 ASR 与 MT 服务各自的 CPU、GPU、内存；数据由各服务自己的 `/hardware` 端点采样，另附已加载/可用模型；面板打开时每 3 秒刷新。
 - 编辑器支持双语编辑、时间编辑、CPS/行长提示、split/merge/delete、undo/redo、自动保存、波形、Transcript 审查与 QA/Punch list。
+- 编辑器 ASS 感知：override tag 以不可编辑 chip 呈现，`\N` 为换行 chip，绘图行只读且不进 MT/QA；锁定行拒绝编辑。
+- 编辑器建议面板：按当前行查询记忆库与术语，显示匹配率并可一键插入；单行 MT 建议只展示、不写回。
+- 段落状态：空 / 机器翻译建议 / 记忆库建议 / 已翻译 / 已审阅 / 已确认 / 已退回；确认后写入本机记忆库，相同原文的未确认行自动传播。
+- 样式标签页：编辑 `assets/template.ass` 的样式表与脚本信息，查看当前行 override 标签与最近操作记录。
 
 ## ASR / MT
 
@@ -143,13 +150,17 @@ ASR 云端响应必须包含词级时间戳；只有纯文本的响应会被拒�
 ASR 服务提供：
 
 ```text
+GET  /health
+GET  /hardware          # 该服务的 CPU / GPU / 内存
 GET  /v1/models
 POST /v1/models/load
 POST /v1/models/switch
 POST /v1/models/unload
 ```
 
-MT 本地服务使用 llama-server router 模式（`--models-dir`、`--models-max`、`--models-autoload`），可通过请求中的模型 ID 自动加载/卸载/切换。
+MT 本地服务由 `ncat.test.mt_server` 作为监督进程提供：llama-server 跑在内部回环端口，
+对外端口转发全部 OpenAI 兼容请求，并额外提供 `GET /health`、`GET /hardware`；
+模型仍通过 llama-server router 的模型 ID 自动加载/卸载/切换。
 
 ### 自定义后端
 

@@ -93,8 +93,19 @@ export const api = {
     { method: "PATCH", body: JSON.stringify({ status }) }),
   suggest: (id, sid, q) => request(
     `/projects/${enc(id)}/subprojects/${enc(sid)}/suggest?q=${enc(q)}`),
+  suggestMt: (id, sid, cueId) => request(
+    `/projects/${enc(id)}/subprojects/${enc(sid)}/cues/${enc(cueId)}/suggest-mt`,
+    { method: "POST" }),
+  patchSegment: (id, sid, segmentId, body) => request(
+    `/projects/${enc(id)}/subprojects/${enc(sid)}/segments/${enc(segmentId)}`,
+    { method: "PATCH", body: JSON.stringify(body) }),
   styles: (id, sid) => request(
     `/projects/${enc(id)}/subprojects/${enc(sid)}/styles`),
+  patchStyle: (id, sid, body) => request(
+    `/projects/${enc(id)}/subprojects/${enc(sid)}/styles`,
+    { method: "PATCH", body: JSON.stringify(body) }),
+  audit: (id, sid, limit = 50) => request(
+    `/projects/${enc(id)}/subprojects/${enc(sid)}/audit?limit=${limit}`),
   history: (id, sid) => request(
     `/projects/${enc(id)}/subprojects/${enc(sid)}/history`),
   undo: (id, sid) => request(
@@ -114,6 +125,16 @@ export const api = {
   }),
   system: () => request("/system"),
   healthStatus: () => request("/health/status"),
+  board: (projectId) => request(
+    `/board${projectId ? `?project_id=${enc(projectId)}` : ""}`),
+  boardMove: (moves) => request("/board/move", {
+    method: "POST", body: JSON.stringify({ moves }),
+  }),
+  workflow: (id, sid) => request(
+    `/projects/${enc(id)}/subprojects/${enc(sid)}/workflow`),
+  patchWorkflow: (id, sid, body) => request(
+    `/projects/${enc(id)}/subprojects/${enc(sid)}/workflow`,
+    { method: "PATCH", body: JSON.stringify(body) }),
   settings: () => request("/settings"),
   saveSettings: (body) => request("/settings", {
     method: "PATCH", body: JSON.stringify(body),

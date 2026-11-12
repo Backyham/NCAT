@@ -21,6 +21,8 @@ GT/
 
 # Documents - Do not remove, might contain sensitive materials that should not be committed
 docs/
+AGENT*
+INSTRUCTIONS.md
 
 # Test scripts - build tools, no need to commit
 tests/

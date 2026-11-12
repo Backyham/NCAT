@@ -55,6 +55,7 @@ class Subproject:
     target_langs: list[str] = field(default_factory=lambda: ["zh-Hans"])
     termbase_ids: list[str] = field(default_factory=list)
     tm_ids: list[str] = field(default_factory=list)
+    workflow: dict[str, Any] = field(default_factory=dict)
     created_at: str | None = None
     updated_at: str | None = None
 

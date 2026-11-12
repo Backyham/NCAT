@@ -8,6 +8,7 @@ from typing import Iterable
 
 from .project import new_id, now_iso
 from .subs.rules import cue_metrics
+from .subs.tags import visible_text
 from .text import normalise_key
 from .types import (
     Cue, QAItem, QASeverity, QAStatus, Segment, Term, TermStatus,
@@ -35,19 +36,21 @@ def run_qa(project_id: str, segments: Iterable[Segment],
     items: list[QAItem] = []
 
     for segment in segment_list:
-        if not segment.target.strip():
+        source_text = visible_text(segment.source)
+        target_text = visible_text(segment.target)
+        if not target_text.strip():
             items.append(_item(project_id, "empty_target", QASeverity.ERROR,
                                "Target is empty", segment_id=segment.id,
-                               evidence=segment.source))
+                               evidence=source_text))
             continue
-        if normalise_key(segment.source) == normalise_key(segment.target):
+        if normalise_key(source_text) == normalise_key(target_text):
             items.append(_item(project_id, "source_equals_target",
                                QASeverity.WARNING,
                                "Source and target are identical",
                                segment_id=segment.id,
-                               evidence=segment.source))
-        source_numbers = set(_NUMBER.findall(segment.source))
-        target_numbers = set(_NUMBER.findall(segment.target))
+                               evidence=source_text))
+        source_numbers = set(_NUMBER.findall(source_text))
+        target_numbers = set(_NUMBER.findall(target_text))
         if source_numbers != target_numbers:
             items.append(_item(project_id, "number_mismatch",
                                QASeverity.WARNING,
@@ -63,21 +66,23 @@ def run_qa(project_id: str, segments: Iterable[Segment],
         if not key:
             continue
         for segment in segment_list:
-            if key not in normalise_key(segment.source):
+            source_key = normalise_key(visible_text(segment.source))
+            target_key = normalise_key(visible_text(segment.target))
+            if key not in source_key:
                 continue
             if term.forbidden:
-                if term.target and normalise_key(term.target) in \
-                        normalise_key(segment.target):
+                if term.target and normalise_key(term.target) in target_key:
                     items.append(_item(
                         project_id, "forbidden_term", QASeverity.ERROR,
                         f"Forbidden term used: {term.source}",
-                        segment_id=segment.id, evidence=segment.target))
-            elif term.target and normalise_key(term.target) not in \
-                    normalise_key(segment.target):
+                        segment_id=segment.id,
+                        evidence=visible_text(segment.target)))
+            elif term.target and normalise_key(term.target) not in target_key:
                 items.append(_item(
                     project_id, "term_missing", QASeverity.WARNING,
                     f"Preferred term missing: {term.source} -> {term.target}",
-                    segment_id=segment.id, evidence=segment.target))
+                    segment_id=segment.id,
+                    evidence=visible_text(segment.target)))
 
     for cue in cue_list:
         metrics = cue_metrics(cue)

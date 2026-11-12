@@ -1,24 +1,17 @@
 """Subtitle readability metrics and timing checks."""
 from __future__ import annotations
 
-import re
 from typing import Any, Iterable
 
 from ..text import cps
 from ..types import Cue
-
-_TAG = re.compile(r"\{[^}]*\}")
+from .tags import cue_kind, visible_text
 
 DEFAULT_MAX_CPS_SOURCE = 20.0
 DEFAULT_MAX_CPS_TARGET = 17.0
 DEFAULT_MAX_LINE_LENGTH = 42
 DEFAULT_MAX_LINES = 2
 DEFAULT_MIN_DURATION_MS = 500
-
-
-def visible_text(text: str) -> str:
-    value = _TAG.sub("", text or "")
-    return value.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
 
 
 def text_lines(text: str) -> list[str]:
@@ -37,6 +30,18 @@ def cue_metrics(
     duration = None
     if cue.start_ms is not None and cue.end_ms is not None:
         duration = max(0, cue.end_ms - cue.start_ms)
+    kind = cue_kind(cue.source_text, cue.target_text)
+    if kind == "drawing":
+        # 矢量绘图行（{\p1}…{\p0}）没有可读文本：CPS/行长无意义，也不进 QA。
+        return {
+            "kind": "drawing",
+            "duration_ms": duration,
+            "cps_source": None,
+            "cps_target": None,
+            "line_length": None,
+            "lines": None,
+            "warnings": [],
+        }
     source_lines = text_lines(cue.source_text)
     target_lines = text_lines(cue.target_text)
     source_length = max((len(line) for line in source_lines), default=0)
@@ -59,6 +64,7 @@ def cue_metrics(
     if not cue.target_text.strip():
         warnings.append("empty_target")
     return {
+        "kind": "text",
         "duration_ms": duration,
         "cps_source": round(source_cps, 2) if source_cps is not None else None,
         "cps_target": round(target_cps, 2) if target_cps is not None else None,

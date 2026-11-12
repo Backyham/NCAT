@@ -36,5 +36,11 @@ Tailwind 官方明确说明 Play CDN **仅供开发使用**，它在页面加载
 
 ## 校验
 
-当前 Web UI 是纯空壳，没有 `static/js/` 文件，也没有前端校验脚本。重建 UI 时再补。
+前端脚本在 `static/js/`（无构建，浏览器直接加载 ES Modules）。JS 改完后至少做一次语法检查：
+
+```bash
+node --check static/js/app.js
+node --check static/js/api.js
+```
+
 本目录是第三方代码，不归本项目维护。

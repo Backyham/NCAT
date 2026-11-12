@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NCAT Web Editor</title>
+<title>NCAT 字幕工作台</title>
 <link rel="stylesheet" href="css/app.css">
 <script type="module" src="js/app.js"></script>
 </head>
@@ -15,21 +15,18 @@
     <span class="brand-sub">Nick's Computer-Aided Translating Solution</span>
   </button>
   <nav class="tabs" id="tabs">
-    <button class="tab" data-tab="transcribe">Transcribe</button>
-    <button class="tab" data-tab="terms">Terms</button>
-    <button class="tab" data-tab="tm">TM</button>
-    <button class="tab" data-tab="settings">Settings</button>
+    <button class="tab" data-tab="transcribe">转写</button>
+    <button class="tab" data-tab="terms">术语</button>
+    <button class="tab" data-tab="tm">记忆库</button>
+    <button class="tab" data-tab="settings">设置</button>
   </nav>
-  <span id="status" class="sr-only">idle</span>
+  <span id="status" class="sr-only">空闲</span>
   <button class="health-button" id="health-toggle" type="button">
-    <span class="health-dot" id="health-dot"></span> Health
+    <span class="health-dot" id="health-dot"></span> 运行状态
   </button>
   <div class="health-popover" id="health-popover" hidden>
-    <div class="panel-head"><span>Health Monitor</span></div>
-    <div class="hw-card" id="hw-gpu">GPU —</div>
-    <div class="hw-card" id="hw-cpu">CPU —</div>
-    <div class="hw-card" id="hw-mem">RAM —</div>
-    <div class="hw-card" id="hw-disk">Disk —</div>
+    <div class="panel-head"><span>服务运行状态</span>
+      <span class="health-updated" id="health-updated">—</span></div>
     <div class="health-services" id="health-services"></div>
   </div>
 </header>
@@ -42,10 +39,10 @@
       <p class="home-subtitle">Nick's Computer-Aided Translating Solution</p>
     </div>
     <div class="home-right">
-      <button class="btn home-new" id="new-project" type="button">New Project</button>
+      <button class="btn home-new" id="new-project" type="button">新建项目</button>
       <div class="home-divider"></div>
       <div class="recent-head">
-        <span>Recent projects</span>
+        <span>最近项目</span>
         <span class="panel-count" id="project-count">0</span>
       </div>
       <div class="project-list" id="project-list"></div>
@@ -55,70 +52,83 @@
   <section class="project-shell" id="project-shell" hidden>
     <div class="project-shell-head">
       <div class="project-shell-title">
-        <h2 id="project-name">Project</h2>
+        <h2 id="project-name">项目</h2>
         <div class="project-meta" id="project-meta"></div>
       </div>
       <div class="project-shell-controls">
-        <label>Project
+        <div class="view-switch" id="project-view-switch">
+          <button class="view-btn is-active" data-project-view="board" type="button">看板</button>
+          <button class="view-btn" data-project-view="list" type="button">列表</button>
+        </div>
+        <label>项目
           <select id="project-select"><option value="">—</option></select>
         </label>
-        <label>Subproject
+        <label>子项目
           <select id="subproject-select"><option value="">—</option></select>
         </label>
-        <button class="btn btn-quiet" type="button" id="refresh-context">Refresh</button>
-        <button class="btn btn-quiet" type="button" id="open-subproject">+ Subproject</button>
-        <button class="btn btn-quiet" type="button" id="home-button">Home</button>
+        <button class="btn btn-quiet" type="button" id="refresh-context">刷新</button>
+        <button class="btn btn-quiet" type="button" id="open-subproject">+ 子项目</button>
+        <button class="btn btn-quiet" type="button" id="home-button">返回首页</button>
       </div>
     </div>
     <div class="context-note" id="context-note"></div>
     <nav class="project-tabs" id="project-tabs">
-      <button class="tab is-active" data-project-tab="assets">Assets</button>
-      <button class="tab" data-project-tab="editor">Editor</button>
-      <button class="tab" data-project-tab="transcript">Transcript</button>
-      <button class="tab" data-project-tab="qa">QA</button>
+      <button class="tab is-active" data-project-tab="assets">素材</button>
+      <button class="tab" data-project-tab="editor">编辑器</button>
+      <button class="tab" data-project-tab="transcript">转写稿</button>
+      <button class="tab" data-project-tab="styles">样式</button>
+      <button class="tab" data-project-tab="qa">质检</button>
     </nav>
+
+    <section class="project-board" id="project-board" hidden>
+      <div class="board-toolbar">
+        <input id="board-filter" type="search" placeholder="筛选卡片（名称 / 标签）">
+        <label class="board-toggle"><input id="board-show-archived" type="checkbox" checked> 显示已归档</label>
+      </div>
+      <div class="board" id="board"></div>
+    </section>
 
     <section class="project-panel is-active" data-project-panel="assets">
       <div class="two-col">
         <section class="panel">
-          <div class="panel-head"><span>Asset / ingest</span></div>
+          <div class="panel-head"><span>素材与导入</span></div>
           <div class="stack-form">
-            <div class="asset-summary" id="asset-summary">Select a subproject.</div>
+            <div class="asset-summary" id="asset-summary">请选择子项目。</div>
             <div class="timing-grid">
-              <label class="field compact"><span>Proxy height</span>
+              <label class="field compact"><span>代理高度</span>
                 <input id="ingest-height" type="number" value="720"></label>
-              <label class="field compact"><span>Encoder</span>
-                <input id="ingest-encoder" placeholder="auto"></label>
+              <label class="field compact"><span>编码器</span>
+                <input id="ingest-encoder" placeholder="自动"></label>
             </div>
             <div class="form-actions">
-              <button class="btn" data-action="ingest">Ingest</button>
-              <button class="btn btn-quiet" data-action="segment">Segment from transcript</button>
-              <button class="btn btn-quiet" data-action="align">Align cues</button>
-              <button class="btn btn-quiet" data-action="translate">MT suggest</button>
-              <button class="btn btn-quiet" data-action="style">Export ASS</button>
-              <button class="btn" data-action="render">Render</button>
+              <button class="btn" data-action="ingest">转码入库</button>
+              <button class="btn btn-quiet" data-action="segment">从转写稿分段</button>
+              <button class="btn btn-quiet" data-action="align">对齐时间轴</button>
+              <button class="btn btn-quiet" data-action="translate">机器翻译建议</button>
+              <button class="btn btn-quiet" data-action="style">导出 ASS</button>
+              <button class="btn" data-action="render">渲染视频</button>
             </div>
-            <h3>Import bilingual text</h3>
-            <label class="field"><span>Source text file</span>
+            <h3>导入双语文本</h3>
+            <label class="field"><span>原文文件</span>
               <input id="text-source-path" placeholder="/path/to/source.en.txt"></label>
-            <label class="field"><span>Target text file (optional)</span>
+            <label class="field"><span>译文文件（可选）</span>
               <input id="text-target-path" placeholder="/path/to/target.zh.txt"></label>
             <div class="form-actions">
-              <button class="btn" data-action="import-text">Import text</button>
+              <button class="btn" data-action="import-text">导入文本</button>
             </div>
-            <h3>Import ASS</h3>
-            <label class="field"><span>ASS path</span>
+            <h3>导入 ASS</h3>
+            <label class="field"><span>ASS 路径</span>
               <input id="ass-path" placeholder="/path/to/subtitle.ass"></label>
-            <label class="field checkbox"><span>Only bilingual cues</span>
+            <label class="field checkbox"><span>仅导入双语句对</span>
               <input id="ass-bilingual-only" type="checkbox"></label>
             <div class="form-actions">
-              <button class="btn" data-action="import-ass">Import ASS</button>
+              <button class="btn" data-action="import-ass">导入 ASS</button>
             </div>
             <div class="form-message" id="asset-message"></div>
           </div>
         </section>
         <section class="panel">
-          <div class="panel-head"><span>Media preview</span></div>
+          <div class="panel-head"><span>媒体预览</span></div>
           <video id="asset-video" controls preload="metadata"></video>
           <div class="preview-meta" id="asset-media-meta"></div>
         </section>
@@ -129,46 +139,74 @@
       <div class="project-context-strip" id="editor-context"></div>
       <div class="workspace-grid editor-grid">
         <section class="panel cue-panel">
-          <div class="panel-head"><span>Cues</span>
+          <div class="panel-head"><span>字幕行</span>
             <span class="panel-count" id="cue-count">0</span></div>
-          <div class="cue-list" id="cue-list" role="list"></div>
+          <div class="status-tree" id="status-tree" role="tree"></div>
         </section>
         <section class="panel preview-panel">
-          <div class="panel-head"><span>Preview</span>
+          <div class="panel-head"><span>预览</span>
             <span class="panel-count" id="preview-time">0:00</span></div>
           <video id="video" controls preload="metadata"></video>
-          <div class="preview-meta" id="preview-meta">No proxy yet. Run ingest.</div>
+          <div class="preview-meta" id="preview-meta">尚无代理视频，请先转码入库。</div>
           <div class="timeline-bar">
             <input type="range" id="seek" min="0" max="1000" value="0">
           </div>
           <canvas id="waveform" class="waveform" height="72"></canvas>
         </section>
         <section class="panel edit-panel">
-          <div class="panel-head"><span>Segment editor</span>
-            <span class="panel-count" id="edit-state">no selection</span></div>
-          <label class="field"><span>Target</span>
-            <textarea id="target-text" rows="5" placeholder="译文"></textarea></label>
-          <label class="field"><span>Source</span>
-            <textarea id="source-text" rows="4" placeholder="源文"></textarea></label>
+          <div class="panel-head"><span>行编辑</span>
+            <span class="panel-count" id="edit-state">未选择</span></div>
+          <div class="field"><span>译文 <em class="tag-count" id="target-tags"></em></span>
+            <div id="target-text" class="tag-editor" contenteditable="true"
+                 role="textbox" aria-multiline="true" data-placeholder="译文"></div>
+          </div>
+          <div class="field"><span>原文 <em class="tag-count" id="source-tags"></em></span>
+            <div id="source-text" class="tag-editor tag-editor-source" contenteditable="true"
+                 role="textbox" aria-multiline="true" data-placeholder="原文"></div>
+          </div>
+          <div class="artwork-note" id="artwork-note" hidden></div>
           <div class="timing-grid">
-            <label class="field compact"><span>Start ms</span>
+            <label class="field compact"><span>开始（毫秒）</span>
               <input id="start-ms" type="number" step="10"></label>
-            <label class="field compact"><span>End ms</span>
+            <label class="field compact"><span>结束（毫秒）</span>
               <input id="end-ms" type="number" step="10"></label>
-            <label class="field compact"><span>Style</span>
+            <label class="field compact"><span>样式</span>
               <input id="cue-style" type="text"></label>
-            <label class="field compact checkbox"><span>Locked</span>
+            <label class="field compact"><span>状态</span>
+              <select id="segment-status">
+                <option value="empty">空</option>
+                <option value="mt_suggested">机器翻译建议</option>
+                <option value="tm_suggested">记忆库建议</option>
+                <option value="translated">已翻译</option>
+                <option value="reviewed">已审阅</option>
+                <option value="approved">已确认</option>
+                <option value="rejected">已退回</option>
+              </select></label>
+          </div>
+          <div class="timing-grid timing-grid-one">
+            <label class="field compact checkbox"><span>锁定本行</span>
               <input id="cue-locked" type="checkbox"></label>
           </div>
           <div class="edit-actions">
-            <button class="btn" id="save-cue">Save</button>
-            <button class="btn btn-quiet" id="undo">Undo</button>
-            <button class="btn btn-quiet" id="redo">Redo</button>
-            <button class="btn btn-quiet" id="split-cue">Split</button>
-            <button class="btn btn-quiet" id="merge-cue">Merge next</button>
-            <button class="btn btn-danger" id="delete-cue">Delete</button>
+            <button class="btn" id="save-cue">保存</button>
+            <button class="btn btn-quiet" id="undo">撤销</button>
+            <button class="btn btn-quiet" id="redo">重做</button>
+            <button class="btn btn-quiet" id="split-cue">拆分</button>
+            <button class="btn btn-quiet" id="merge-cue">与下一行合并</button>
+            <button class="btn btn-danger" id="delete-cue">删除</button>
           </div>
           <div class="metrics" id="metrics"></div>
+
+          <div class="suggest-block">
+            <div class="panel-head"><span>建议</span>
+              <span class="panel-count" id="suggest-state">—</span></div>
+            <div class="suggest-list" id="suggest-list"></div>
+            <div class="edit-actions">
+              <button class="btn btn-quiet" id="suggest-refresh">查记忆库/术语</button>
+              <button class="btn btn-quiet" id="suggest-mt">机器翻译建议</button>
+            </div>
+          </div>
+
           <div class="style-preview" id="style-preview">样式预览</div>
           <div class="transcript-preview" id="transcript-preview"></div>
         </section>
@@ -178,30 +216,90 @@
     <section class="project-panel" data-project-panel="transcript" hidden>
       <div class="two-col">
         <section class="panel">
-          <div class="panel-head"><span>Transcript</span>
+          <div class="panel-head"><span>转写稿</span>
             <span class="panel-count" id="transcript-meta"></span></div>
-          <pre class="transcript-full" id="transcript-full">No transcript.</pre>
+          <pre class="transcript-full" id="transcript-full">暂无转写稿。</pre>
         </section>
         <section class="panel">
-          <div class="panel-head"><span>Words / confidence</span>
+          <div class="panel-head"><span>词级时间与置信度</span>
             <span class="panel-count" id="word-count">0</span></div>
           <div class="table-wrap"><table class="data-table" id="word-table">
-            <thead><tr><th>#</th><th>Word</th><th>Start</th><th>End</th><th>Conf</th></tr></thead>
+            <thead><tr><th>#</th><th>词</th><th>开始</th><th>结束</th><th>置信度</th></tr></thead>
             <tbody></tbody></table></div>
+        </section>
+      </div>
+    </section>
+
+    <section class="project-panel" data-project-panel="styles" hidden>
+      <div class="two-col">
+        <section class="panel">
+          <div class="panel-head"><span>样式表</span>
+            <span class="panel-count" id="style-count">0</span></div>
+          <div class="table-wrap"><table class="data-table" id="style-table">
+            <thead><tr><th>名称</th><th>字体</th><th>字号</th><th>主色</th><th>描边</th><th>对齐</th></tr></thead>
+            <tbody></tbody></table></div>
+          <div class="form-message" id="style-message"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><span>样式编辑</span>
+            <span class="panel-count" id="style-edit-name">未选择</span></div>
+          <div class="stack-form" id="style-form">
+            <div class="timing-grid timing-grid-two">
+              <label class="field compact"><span>字体</span>
+                <input id="style-font" placeholder="WenQuanYi Micro Hei"></label>
+              <label class="field compact"><span>字号</span>
+                <input id="style-size" type="number" step="1"></label>
+            </div>
+            <div class="timing-grid timing-grid-four">
+              <label class="field compact"><span>主色</span>
+                <input id="style-primary" type="color"></label>
+              <label class="field compact"><span>描边色</span>
+                <input id="style-outline-color" type="color"></label>
+              <label class="field compact"><span>描边宽度</span>
+                <input id="style-outline" type="number" step="0.1"></label>
+              <label class="field compact"><span>阴影</span>
+                <input id="style-shadow" type="number" step="0.1"></label>
+            </div>
+            <div class="timing-grid timing-grid-four">
+              <label class="field compact"><span>对齐</span>
+                <select id="style-alignment">
+                  <option value="1">左下</option><option value="2">中下</option>
+                  <option value="3">右下</option><option value="4">左中</option>
+                  <option value="5">中中</option><option value="6">右中</option>
+                  <option value="7">左上</option><option value="8">中上</option>
+                  <option value="9">右上</option>
+                </select></label>
+              <label class="field compact"><span>左边距</span>
+                <input id="style-margin-l" type="number"></label>
+              <label class="field compact"><span>右边距</span>
+                <input id="style-margin-r" type="number"></label>
+              <label class="field compact"><span>垂直边距</span>
+                <input id="style-margin-v" type="number"></label>
+            </div>
+            <div class="form-actions">
+              <button class="btn" id="style-save">保存样式</button>
+            </div>
+          </div>
+          <h3>脚本信息</h3>
+          <pre class="script-info" id="script-info">—</pre>
+          <h3>当前行标签</h3>
+          <div class="tag-inspector" id="tag-list">未选择字幕行。</div>
+          <h3>最近操作</h3>
+          <div class="tag-inspector" id="audit-list">—</div>
         </section>
       </div>
     </section>
 
     <section class="project-panel" data-project-panel="qa" hidden>
       <div class="panel">
-        <div class="panel-head"><span>QA / Punch list</span>
+        <div class="panel-head"><span>质检与待办</span>
           <span class="panel-count" id="qa-count">0</span></div>
         <div class="form-actions">
-          <button class="btn" id="run-qa">Run QA</button>
+          <button class="btn" id="run-qa">运行质检</button>
           <span class="form-message" id="qa-message"></span>
         </div>
         <div class="table-wrap"><table class="data-table" id="qa-table">
-          <thead><tr><th>Severity</th><th>Kind</th><th>Message</th><th>Evidence</th><th>Action</th></tr></thead>
+          <thead><tr><th>级别</th><th>类型</th><th>说明</th><th>证据</th><th>操作</th></tr></thead>
           <tbody></tbody></table></div>
       </div>
     </section>
@@ -211,38 +309,38 @@
 
   <section class="tab-panel" data-panel="terms">
     <div class="asset-filter">
-      <label>Project filter
-        <select id="terms-project-filter"><option value="">All projects</option></select>
+      <label>项目筛选
+        <select id="terms-project-filter"><option value="">全部项目</option></select>
       </label>
-      <span class="form-message">Browse all termbases or filter by project.</span>
+      <span class="form-message">可浏览全部术语库，或按项目筛选。</span>
     </div>
     <div class="two-col">
       <section class="panel">
-        <div class="panel-head"><span>Termbases</span></div>
+        <div class="panel-head"><span>术语库</span></div>
         <div class="table-wrap"><table class="data-table" id="termbase-table">
-          <thead><tr><th>Name</th><th>Project</th><th>Level</th><th>Terms</th></tr></thead>
+          <thead><tr><th>名称</th><th>项目</th><th>层级</th><th>条目数</th></tr></thead>
           <tbody></tbody></table></div>
-        <h3>Import termbase</h3>
+        <h3>导入术语库</h3>
         <div class="timing-grid">
-          <label class="field compact"><span>Name</span>
-            <input id="termbase-name" placeholder="optional"></label>
-          <label class="field compact"><span>Level</span>
+          <label class="field compact"><span>名称</span>
+            <input id="termbase-name" placeholder="可选"></label>
+          <label class="field compact"><span>层级</span>
             <select id="termbase-level">
-              <option value="project">project</option>
-              <option value="subproject">subproject</option>
+              <option value="project">项目</option>
+              <option value="subproject">子项目</option>
             </select></label>
-          <label class="field compact"><span>Path</span>
+          <label class="field compact"><span>路径</span>
             <input id="termbase-path" placeholder=".jsonl / .tsv / .csv"></label>
         </div>
         <div class="form-actions">
-          <button class="btn" id="import-termbase">Import termbase</button>
+          <button class="btn" id="import-termbase">导入术语库</button>
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><span>Effective terms</span>
+        <div class="panel-head"><span>生效术语</span>
           <span class="panel-count" id="term-count">0</span></div>
         <div class="table-wrap"><table class="data-table" id="term-table">
-          <thead><tr><th>Project</th><th>Source</th><th>Target</th><th>Status</th><th>Context</th></tr></thead>
+          <thead><tr><th>项目</th><th>原文</th><th>译文</th><th>状态</th><th>语境</th></tr></thead>
           <tbody></tbody></table></div>
       </section>
     </div>
@@ -250,40 +348,49 @@
 
   <section class="tab-panel" data-panel="tm">
     <div class="asset-filter">
-      <label>Project filter
-        <select id="tm-project-filter"><option value="">All projects</option></select>
+      <label>项目筛选
+        <select id="tm-project-filter"><option value="">全部项目</option></select>
       </label>
-      <span class="form-message">Browse all memories or filter by project.</span>
+      <label>检索
+        <input id="tm-query" placeholder="原文或译文片段"></label>
+      <button class="btn btn-quiet" id="tm-search">检索</button>
+      <button class="btn btn-quiet" id="tm-export">导出 TMX</button>
+      <span class="form-message" id="tm-message">可浏览全部记忆库，或按项目筛选。</span>
+    </div>
+    <div class="table-wrap" id="tm-result-wrap" hidden>
+      <table class="data-table" id="tm-result-table">
+        <thead><tr><th>匹配</th><th>原文</th><th>译文</th><th>项目</th></tr></thead>
+        <tbody></tbody></table>
     </div>
     <div class="two-col">
       <section class="panel">
-        <div class="panel-head"><span>Translation memories</span></div>
+        <div class="panel-head"><span>翻译记忆库</span></div>
         <div class="table-wrap"><table class="data-table" id="tm-table">
-          <thead><tr><th>Name</th><th>Project</th><th>Level</th><th>Units</th></tr></thead>
+          <thead><tr><th>名称</th><th>项目</th><th>层级</th><th>条目数</th></tr></thead>
           <tbody></tbody></table></div>
-        <h3>Import bilingual TM</h3>
+        <h3>导入双语记忆库</h3>
         <div class="timing-grid">
-          <label class="field compact"><span>Name</span>
-            <input id="tm-name" placeholder="optional"></label>
-          <label class="field compact"><span>Level</span>
+          <label class="field compact"><span>名称</span>
+            <input id="tm-name" placeholder="可选"></label>
+          <label class="field compact"><span>层级</span>
             <select id="tm-level">
-              <option value="project">project</option>
-              <option value="subproject">subproject</option>
+              <option value="project">项目</option>
+              <option value="subproject">子项目</option>
             </select></label>
-          <label class="field compact"><span>Source file</span>
+          <label class="field compact"><span>原文文件</span>
             <input id="tm-source-path" placeholder=".en.txt"></label>
-          <label class="field compact"><span>Target file</span>
+          <label class="field compact"><span>译文文件</span>
             <input id="tm-target-path" placeholder=".zh.txt"></label>
         </div>
         <div class="form-actions">
-          <button class="btn" id="import-tm">Import TM</button>
+          <button class="btn" id="import-tm">导入记忆库</button>
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><span>Effective memory</span>
+        <div class="panel-head"><span>生效记忆</span>
           <span class="panel-count" id="tm-count">0</span></div>
         <div class="table-wrap"><table class="data-table" id="tm-unit-table">
-          <thead><tr><th>Project</th><th>Source</th><th>Target</th><th>Lang</th></tr></thead>
+          <thead><tr><th>项目</th><th>原文</th><th>译文</th><th>语言</th></tr></thead>
           <tbody></tbody></table></div>
       </section>
     </div>
@@ -291,13 +398,13 @@
 
   <section class="tab-panel" data-panel="transcribe">
     <div class="panel">
-      <div class="panel-head"><span>Transcribe task queue</span>
+      <div class="panel-head"><span>转写任务队列</span>
         <span class="panel-actions">
-          <button class="btn" id="open-transcribe">New task</button>
-          <button class="btn btn-quiet" id="refresh-jobs">Refresh</button>
+          <button class="btn" id="open-transcribe">新建任务</button>
+          <button class="btn btn-quiet" id="refresh-jobs">刷新</button>
         </span></div>
       <div class="table-wrap"><table class="data-table" id="job-table">
-        <thead><tr><th>Job</th><th>Status</th><th>Stage</th><th>Elapsed</th><th>Result</th></tr></thead>
+        <thead><tr><th>任务</th><th>状态</th><th>阶段</th><th>用时</th><th>结果</th></tr></thead>
         <tbody></tbody></table></div>
     </div>
   </section>
@@ -305,46 +412,44 @@
   <section class="tab-panel" data-panel="settings">
     <div class="settings-grid">
       <section class="panel">
-        <div class="panel-head"><span>ASR service</span></div>
+        <div class="panel-head"><span>ASR 服务</span></div>
         <div class="stack-form">
-          <label class="field"><span>Mode</span>
+          <label class="field"><span>模式</span>
             <select id="settings-asr-mode">
-              <option value="local">Local service (no API key)</option>
-              <option value="cloud">Cloud API</option>
+              <option value="local">本地服务（无需 API Key）</option>
+              <option value="cloud">云端 API</option>
             </select></label>
           <label class="field"><span>API Key</span>
             <input id="settings-asr-api-key" type="password" autocomplete="off"
-              placeholder="leave blank to keep current key"></label>
-          <label class="field checkbox"><span>Clear ASR key</span>
+              placeholder="留空则保留当前 Key"></label>
+          <label class="field checkbox"><span>清除 ASR Key</span>
             <input id="settings-asr-clear-key" type="checkbox"></label>
           <div class="form-message" id="settings-asr-key-state"></div>
-          <div class="form-message">Local ASR endpoint is configured by the
-            server (<code>NCAT_ASR_LOCAL_URL</code>); cloud endpoint/model by
-            <code>NCAT_ASR_CLOUD_URL</code> / <code>NCAT_ASR_CLOUD_MODEL</code>.</div>
+          <div class="form-message">本地 ASR 地址由服务端配置（<code>NCAT_ASR_LOCAL_URL</code>）；
+            云端地址与模型由 <code>NCAT_ASR_CLOUD_URL</code> / <code>NCAT_ASR_CLOUD_MODEL</code> 配置。</div>
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><span>MT service</span></div>
+        <div class="panel-head"><span>MT 服务</span></div>
         <div class="stack-form">
-          <label class="field"><span>Mode</span>
+          <label class="field"><span>模式</span>
             <select id="settings-mt-mode">
-              <option value="local">Local service (no API key)</option>
-              <option value="cloud">Cloud API</option>
+              <option value="local">本地服务（无需 API Key）</option>
+              <option value="cloud">云端 API</option>
             </select></label>
           <label class="field"><span>API Key</span>
             <input id="settings-mt-api-key" type="password" autocomplete="off"
-              placeholder="leave blank to keep current key"></label>
-          <label class="field checkbox"><span>Clear MT key</span>
+              placeholder="留空则保留当前 Key"></label>
+          <label class="field checkbox"><span>清除 MT Key</span>
             <input id="settings-mt-clear-key" type="checkbox"></label>
           <div class="form-message" id="settings-mt-key-state"></div>
-          <div class="form-message">Local MT endpoint is configured by the
-            server (<code>NCAT_MT_LOCAL_URL</code>); cloud endpoint/model by
-            <code>NCAT_MT_CLOUD_URL</code> / <code>NCAT_MT_CLOUD_MODEL</code>.</div>
+          <div class="form-message">本地 MT 地址由服务端配置（<code>NCAT_MT_LOCAL_URL</code>）；
+            云端地址与模型由 <code>NCAT_MT_CLOUD_URL</code> / <code>NCAT_MT_CLOUD_MODEL</code> 配置。</div>
         </div>
       </section>
     </div>
     <div class="form-actions">
-      <button class="btn" id="settings-save">Save settings</button>
+      <button class="btn" id="settings-save">保存设置</button>
       <span class="form-message" id="settings-message"></span>
     </div>
     <div id="model-list" hidden></div>
@@ -354,24 +459,24 @@
 
 <dialog id="project-dialog" class="modal">
   <form class="modal-box" id="project-form" method="dialog">
-    <h3>New project</h3>
-    <label class="field"><span>Name</span>
-      <input id="new-name" placeholder="Client / long-term project"></label>
-    <label class="field"><span>Client</span>
-      <input id="new-client" placeholder="optional"></label>
+    <h3>新建项目</h3>
+    <label class="field"><span>名称</span>
+      <input id="new-name" placeholder="客户 / 长期项目"></label>
+    <label class="field"><span>客户</span>
+      <input id="new-client" placeholder="可选"></label>
     <div class="timing-grid">
-      <label class="field compact"><span>Source language</span>
+      <label class="field compact"><span>源语言</span>
         <input id="new-source-lang" value="en"></label>
-      <label class="field compact"><span>Target language</span>
+      <label class="field compact"><span>目标语言</span>
         <input id="new-target-lang" value="zh-Hans"></label>
     </div>
-    <label class="field"><span>Initial source (optional)</span>
+    <label class="field"><span>初始素材（可选）</span>
       <input id="new-source" placeholder="/path/to/video-or-text"></label>
-    <label class="field"><span>Initial subproject name</span>
+    <label class="field"><span>首个子项目名称</span>
       <input id="new-subproject-name" value="Main"></label>
     <div class="form-actions">
-      <button class="btn" type="submit">Create project</button>
-      <button class="btn btn-quiet" type="button" id="cancel-project">Cancel</button>
+      <button class="btn" type="submit">创建项目</button>
+      <button class="btn btn-quiet" type="button" id="cancel-project">取消</button>
     </div>
     <div class="form-message" id="project-message"></div>
   </form>
@@ -379,37 +484,37 @@
 
 <dialog id="subproject-dialog" class="modal">
   <div class="modal-box">
-    <h3>Add subproject</h3>
+    <h3>添加子项目</h3>
     <div class="timing-grid">
-      <label class="field compact"><span>Name</span>
-        <input id="sub-name" placeholder="Video / article / batch"></label>
-      <label class="field compact"><span>Kind</span>
+      <label class="field compact"><span>名称</span>
+        <input id="sub-name" placeholder="视频 / 文章 / 批次"></label>
+      <label class="field compact"><span>类型</span>
         <select id="sub-kind">
-          <option value="video">video</option>
-          <option value="text">text</option>
+          <option value="video">视频</option>
+          <option value="text">文本</option>
         </select></label>
-      <label class="field compact"><span>Source path (optional)</span>
+      <label class="field compact"><span>源文件路径（可选）</span>
         <input id="sub-source" placeholder="/path/to/source"></label>
     </div>
     <div class="form-actions">
-      <button class="btn" id="add-subproject" type="button">Add subproject</button>
-      <button class="btn btn-quiet" id="cancel-subproject" type="button">Cancel</button>
+      <button class="btn" id="add-subproject" type="button">添加子项目</button>
+      <button class="btn btn-quiet" id="cancel-subproject" type="button">取消</button>
     </div>
   </div>
 </dialog>
 
 <dialog id="transcribe-dialog" class="modal">
   <form class="modal-box" id="transcribe-form">
-    <h3>New transcription task</h3>
-    <label class="field"><span>Audio path</span>
+    <h3>新建转写任务</h3>
+    <label class="field"><span>音频路径</span>
       <input id="asr-audio" placeholder="/path/to/audio-or-video"></label>
     <div class="timing-grid">
-      <label class="field compact"><span>Language</span>
+      <label class="field compact"><span>语言</span>
         <input id="asr-language" placeholder="en"></label>
     </div>
     <div class="form-actions">
-      <button class="btn" id="start-transcribe" type="button">Queue transcription</button>
-      <button class="btn btn-quiet" id="cancel-transcribe" type="button">Cancel</button>
+      <button class="btn" id="start-transcribe" type="button">加入转写队列</button>
+      <button class="btn btn-quiet" id="cancel-transcribe" type="button">取消</button>
     </div>
     <div class="form-message" id="transcribe-message"></div>
   </form>

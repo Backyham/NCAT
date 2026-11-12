@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,13 +22,19 @@ from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.responses import (
+    FileResponse, JSONResponse, Response, StreamingResponse,
+)
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from ncat.core.assets.tm import find_matches, read_units
+from ncat.core import workflow as project_workflow
+from ncat.core.assets.tm import (
+    find_matches, read_tmx, read_units, write_tmx, write_units,
+)
 from ncat.core.assets.termbase import match_terms, read_terms
 from ncat.core.history import (
     available as history_available, push as history_push,
@@ -38,6 +45,8 @@ from ncat.core.media import probe_media
 from ncat.core.qa import (
     read_qa, run_qa, update_qa, write_qa,
 )
+from ncat.core.mt import get_backend
+from ncat.core.mt.base import MTRequest, SegmentInput, TMMatch
 from ncat.core.project import (
     load_project, new_id, now_iso, read_cues, read_segments, save_project,
     write_cues, write_segments,
@@ -53,9 +62,11 @@ from ncat.core.subs.model import (
     cues_from_ass, cues_from_segments, merge_cues, split_cue,
 )
 from ncat.core.subs.rules import apply_all, cue_metrics
-from ncat.core.text import source_hash
+from ncat.core.subs import styles as ass_styles
+from ncat.core.subs.tags import cue_kind, tag_count, visible_text
+from ncat.core.text import normalise_key, source_hash
 from ncat.core.types import (
-    Cue, ProjectStage, QAStatus, Segment, SegmentStatus,
+    Cue, ProjectStage, QAStatus, Segment, SegmentStatus, TMUnit,
 )
 from ncat.core.workspace import (
     TermbaseRef, TMRef, WorkspaceProject, add_subproject, add_termbase,
@@ -536,7 +547,12 @@ async def _cues(project, sub, request: Request) -> JSONResponse:
         apply_all(cues)
         write_cues(state.paths, cues)
         return JSONResponse([
-            {**asdict(item), "metrics": cue_metrics(item)}
+            {
+                **asdict(item),
+                "metrics": cue_metrics(item),
+                "kind": cue_kind(item.source_text, item.target_text),
+                "tag_count": tag_count(item.target_text),
+            }
             for item in sorted(cues, key=lambda cue: (
                 cue.start_ms if cue.start_ms is not None else 10**15,
                 cue.order, cue.id))
@@ -622,6 +638,12 @@ async def _segment_detail(project, sub, request: Request) -> JSONResponse:
     found.updated_at = now_iso()
     write_segments(state.paths, segments)
     build_index(state.paths)
+    if "status" in body:
+        _audit(state, "status_change", segment_id=found.id,
+               status=found.status.value)
+        if found.status == SegmentStatus.APPROVED:
+            _remember_translation(state, found.source, found.target,
+                                  segment_id=found.id)
     return JSONResponse(asdict(found))
 
 
@@ -643,6 +665,88 @@ def _override_tags(text: str) -> set[str]:
     return set(re.findall(r"\{[^}]*\}", text or ""))
 
 
+def _audit(state, kind: str, **data) -> None:
+    """Append one audit record; failures never break the request."""
+    row = {"at": now_iso(), "kind": kind, **data}
+    path = state.paths.root / "audit.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _local_tm_path(state) -> Path:
+    return state.paths.assets / "tm.jsonl"
+
+
+def _local_tm_units(state) -> list[TMUnit]:
+    return read_units(_local_tm_path(state))
+
+
+def _remember_translation(state, source: str, target: str, *,
+                          segment_id: str | None = None) -> bool:
+    """Write an approved pair into the subproject TM (confirmed only)."""
+    source_text = visible_text(source).strip()
+    target_text = visible_text(target).strip()
+    if not source_text or not target_text:
+        return False
+    units = _local_tm_units(state)
+    key = source_hash(source_text)
+    units = [unit for unit in units if unit.source_hash != key]
+    project = state.project
+    targets = list(getattr(project, "target_langs", None) or ["zh-Hans"])
+    units.append(TMUnit(
+        id=new_id("tm"), source=source_text, target=target_text,
+        source_lang=getattr(project, "source_lang", "") or "en",
+        target_lang=targets[0],
+        source_hash=key, origin_project=project.id,
+        origin_segment=segment_id, approved_at=now_iso(),
+        created_at=now_iso(),
+    ))
+    write_units(_local_tm_path(state), units)
+    _audit(state, "tm_writeback", segment_id=segment_id,
+           source=source_text, target=target_text)
+    return True
+
+
+def _propagate(state, cues: list[Cue], origin: Cue) -> int:
+    """Copy a changed translation to identical source cues that are unconfirmed."""
+    key = normalise_key(visible_text(origin.source_text))
+    if not key or not origin.target_text.strip():
+        return 0
+    segments = {item.id: item for item in read_segments(state.paths)}
+    changed = 0
+    for cue in cues:
+        if cue.id == origin.id or cue.locked:
+            continue
+        if normalise_key(visible_text(cue.source_text)) != key:
+            continue
+        segment = segments.get(cue.segment_id or "")
+        if segment is not None and segment.status not in {
+                SegmentStatus.EMPTY, SegmentStatus.MT_SUGGESTED,
+                SegmentStatus.TM_SUGGESTED}:
+            continue
+        if cue.target_text == origin.target_text:
+            continue
+        cue.target_text = origin.target_text
+        cue.revision += 1
+        apply_all([cue])
+        if segment is not None:
+            segment.target = cue.target_text
+            segment.status = SegmentStatus.TRANSLATED
+            segment.revision += 1
+            segment.updated_at = now_iso()
+        changed += 1
+    if changed:
+        write_cues(state.paths, cues)
+        write_segments(state.paths, list(segments.values()))
+        build_index(state.paths)
+        _audit(state, "auto_propagate", cue_id=origin.id, count=changed)
+    return changed
+
+
 async def _cue_detail(project, sub, request: Request) -> JSONResponse:
     state = subproject_state(project, sub)
     cues = read_cues(state.paths)
@@ -657,6 +761,13 @@ async def _cue_detail(project, sub, request: Request) -> JSONResponse:
         build_index(state.paths)
         return JSONResponse({"deleted": cue_id})
     body = await _json(request)
+    editable = {"source_text", "target_text", "style", "start_ms", "end_ms",
+                "order"}
+    if found.locked and (set(body) & editable):
+        raise HTTPException(409, detail={
+            "code": "locked",
+            "message": "cue is locked; unlock it before editing",
+        })
     if body.get("protect_tags", True):
         old_tags = _override_tags(found.target_text) | _override_tags(
             found.source_text)
@@ -691,7 +802,9 @@ async def _cue_detail(project, sub, request: Request) -> JSONResponse:
         segments = read_segments(state.paths)
         segment = next((item for item in segments
                         if item.id == found.segment_id), None)
-        if segment is not None:
+        if segment is not None and segment.target != found.target_text:
+            # 只有译文真的变了才动 Segment：编辑器是自动保存的，未改动的
+            # 保存不能把 REVIEWED/APPROVED 抹成 TRANSLATED。
             segment.target = found.target_text
             segment.status = (SegmentStatus.TRANSLATED
                               if found.target_text.strip()
@@ -699,7 +812,17 @@ async def _cue_detail(project, sub, request: Request) -> JSONResponse:
             segment.revision += 1
             segment.updated_at = now_iso()
             write_segments(state.paths, segments)
-    return JSONResponse({**asdict(found), "metrics": cue_metrics(found)})
+            _audit(state, "cue_edit", cue_id=found.id,
+                   segment_id=segment.id, status=segment.status.value)
+    propagated = 0
+    if "target_text" in body:
+        propagated = _propagate(state, cues, found)
+    return JSONResponse({
+        **asdict(found),
+        "metrics": cue_metrics(found),
+        "kind": cue_kind(found.source_text, found.target_text),
+        "propagated": propagated,
+    })
 
 
 async def cue_detail(request: Request) -> JSONResponse:
@@ -805,16 +928,24 @@ async def _import_ass(project, sub, request: Request) -> JSONResponse:
     cues = cues_from_ass(document, state.project.id,
                          bilingual_only=bool(body.get("bilingual_only", False)))
     apply_all(cues)
-    write_cues(state.paths, cues)
+    text_cues = [item for item in cues
+                 if cue_kind(item.source_text, item.target_text) == "text"]
     segments = segments_from_pairs(
-        [(cue.source_text, cue.target_text) for cue in cues],
+        [(item.source_text, item.target_text) for item in text_cues],
         state.project.id,
     )
+    for cue, segment in zip(text_cues, segments):
+        cue.segment_id = segment.id
+    write_cues(state.paths, cues)
     write_segments(state.paths, segments)
     build_index(state.paths)
     state.project.stage = ProjectStage.DRAFTING
     save_project(state)
-    return JSONResponse({"cues": len(cues), "segments": len(segments)})
+    return JSONResponse({
+        "cues": len(cues),
+        "segments": len(segments),
+        "drawings": len(cues) - len(text_cues),
+    })
 
 
 async def import_ass(request: Request) -> JSONResponse:
@@ -1304,37 +1435,38 @@ async def transcribe_backends(request: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
-async def _styles(project, sub) -> JSONResponse:
+async def _styles(project, sub, request: Request | None = None) -> JSONResponse:
     state = subproject_state(project, sub)
-    candidates = [
-        state.paths.renders / f"{_slug(sub.name)}.ass",
-        state.paths.assets / "template.ass",
-    ]
-    path = next((item for item in candidates if item.is_file()), None)
-    if path is None:
-        return JSONResponse({"styles": [], "path": None})
-    document = parse_ass(path)
-    return JSONResponse({
-        "path": str(path),
-        "styles": [
-            {"name": style.name, **style.fields}
-            for style in document.styles
-        ],
-    })
+    if request is not None and request.method == "PATCH":
+        body = await _json(request)
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, detail={
+                "code": "missing_name", "message": "style name is required"})
+        values = body.get("values") or {}
+        if not isinstance(values, dict):
+            raise HTTPException(400, detail={
+                "code": "invalid_values", "message": "values must be an object"})
+        payload = await asyncio.to_thread(
+            ass_styles.update_style, state.paths, name, values)
+        _audit(state, "style_update", style=name)
+        return JSONResponse(payload)
+    return JSONResponse(await asyncio.to_thread(ass_styles.payload,
+                                                state.paths))
 
 
 async def project_styles(request: Request) -> JSONResponse:
     root = workspace_root(request.app.state.workspace)
     project = _find_workspace(root, request.path_params["project_id"])
     sub, _ = _resolve_sub(project)
-    return await _styles(project, sub)
+    return await _styles(project, sub, request)
 
 
 async def subproject_styles(request: Request) -> JSONResponse:
     root = workspace_root(request.app.state.workspace)
     project = _find_workspace(root, request.path_params["project_id"])
     sub = project.subproject(request.path_params["subproject_id"])
-    return await _styles(project, sub)
+    return await _styles(project, sub, request)
 
 
 async def _search(project, sub, request: Request) -> JSONResponse:
@@ -1410,14 +1542,252 @@ async def _suggest(project, sub, request: Request) -> JSONResponse:
     query = request.query_params.get("q", "").strip()
     terms = _qa_terms(project, sub, state)
     units = effective_tm(project, sub)
-    if not units:
-        units = read_units(state.paths.assets / "tm.jsonl")
+    local = _local_tm_units(state)
+    if local:
+        seen = {unit.source_hash for unit in units}
+        units = list(units) + [unit for unit in local
+                               if unit.source_hash not in seen]
     return JSONResponse({
         "query": query,
         "tm": [item.__dict__ for item in find_matches(query, units)],
         "terms": [item.__dict__ for item in match_terms(
             query, terms, confirmed_only=False)],
     })
+
+
+def _mt_options(root: Path) -> tuple[str, str, dict]:
+    """Resolve backend name, model id and options from server settings."""
+    settings = load_settings(root)
+    if settings["mt"].get("mode") == "cloud":
+        return ("openai_compatible", os.environ.get(CLOUD_MT_MODEL, ""),
+                {"base_url": os.environ.get(CLOUD_MT_URL, "")})
+    model = os.environ.get("NCAT_MT_LOCAL_MODEL", "") or "local"
+    base = os.environ.get(LOCAL_MT_URL, "http://127.0.0.1:8080")
+    return "llama_cpp", model, {"base_url": base}
+
+
+async def subproject_cue_mt(request: Request) -> JSONResponse:
+    """One-cue MT suggestion; never writes to the cue, never touches locked rows."""
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = project.subproject(request.path_params["subproject_id"])
+    state = subproject_state(project, sub)
+    cues = read_cues(state.paths)
+    cue = next((item for item in cues
+                if item.id == request.path_params["cue_id"]), None)
+    if cue is None:
+        raise HTTPException(404, detail={"code": "not_found",
+                                         "message": "cue not found"})
+    if cue.locked:
+        raise HTTPException(409, detail={"code": "locked",
+                                         "message": "cue is locked"})
+    source = visible_text(cue.source_text) or visible_text(cue.target_text)
+    if not source.strip():
+        raise HTTPException(400, detail={
+            "code": "empty_source", "message": "cue has no source text"})
+    backend_name, model, options = _mt_options(root)
+    terms = _qa_terms(project, sub, state)
+    units = list(effective_tm(project, sub)) + _local_tm_units(state)
+    matches = [
+        TMMatch(unit_id=hit.unit_id, source=hit.source,
+                target=hit.target, score=hit.score,
+                match_type=hit.match_type)
+        for hit in find_matches(source, units, limit=3)
+    ]
+    hits = match_terms(source, terms, confirmed_only=False)
+    request_payload = MTRequest(
+        source_lang=state.project.source_lang,
+        target_lang=(state.project.target_langs or ["zh-Hans"])[0],
+        segments=[SegmentInput(id=cue.id, source=source,
+                               tm_matches=matches, term_hits=hits)],
+        options=options,
+    )
+    try:
+        result = await asyncio.to_thread(
+            get_backend(backend_name).translate, request_payload)
+    except Exception as exc:
+        raise HTTPException(502, detail={
+            "code": "mt_failed", "message": str(exc)[:300]})
+    target = result.segments[0].target if result.segments else ""
+    _audit(state, "mt_suggestion", cue_id=cue.id, model=result.model,
+           provider=result.provider)
+    return JSONResponse({
+        "target": target,
+        "model": result.model,
+        "provider": result.provider,
+        "usage": {
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+        },
+    })
+
+
+async def tm_export(request: Request) -> Response:
+    root = workspace_root(request.app.state.workspace)
+    groups = await asyncio.to_thread(_all_tm, root, None)
+    units: dict[str, TMUnit] = {}
+    for group in groups:
+        for row in group.get("units", []):
+            try:
+                unit = TMUnit(**row)
+            except TypeError:
+                continue
+            units[unit.source_hash] = unit
+    if not units:
+        raise HTTPException(404, detail={
+            "code": "empty_tm", "message": "no translation units to export"})
+    directory = tempfile.mkdtemp(prefix="ncat-tmx-")
+    path = Path(directory) / "ncat-memory.tmx"
+    write_tmx(units.values(), path)
+    return FileResponse(
+        path, media_type="application/xml", filename="ncat-memory.tmx",
+        background=BackgroundTask(shutil.rmtree, directory,
+                                  ignore_errors=True))
+
+
+async def subproject_audit(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = project.subproject(request.path_params["subproject_id"])
+    state = subproject_state(project, sub)
+    path = state.paths.root / "audit.jsonl"
+    limit = max(1, min(500, int(request.query_params.get("limit", 100))))
+    rows: list[dict] = []
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines()[-limit:]:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return JSONResponse(rows)
+
+
+def _projects_for_board(root: Path, project_id: str | None):
+    if project_id:
+        return [_find_workspace(root, project_id)]
+    projects = []
+    for child in _children(root):
+        if not _has_project(child):
+            continue
+        try:
+            projects.append(load_workspace(child))
+        except Exception:
+            continue
+    return projects
+
+
+async def board_view(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project_id = request.query_params.get("project_id") or None
+
+    def build():
+        cards: list[dict] = []
+        columns = None
+        for project in _projects_for_board(root, project_id):
+            data = project_workflow.board(project)
+            columns = columns or data["columns"]
+            cards.extend(data["cards"])
+        return {
+            "generated_at": now_iso(),
+            "columns": columns or [
+                {"key": key, "label": label}
+                for key, label in project_workflow.STAGES
+            ],
+            "cards": cards,
+        }
+
+    return JSONResponse(await asyncio.to_thread(build))
+
+
+def _validate_stage(stage, derived: str, reason: str) -> str | None:
+    if stage in (None, ""):
+        return None
+    if stage not in project_workflow.STAGE_KEYS:
+        raise HTTPException(400, detail={
+            "code": "invalid_stage", "message": f"unknown stage: {stage}"})
+    order = {key: index for index, key in
+             enumerate(project_workflow.STAGE_KEYS)}
+    if order[stage] < order[derived] and not reason:
+        raise HTTPException(400, detail={
+            "code": "reason_required",
+            "message": "向回移动需要填写原因"})
+    return stage
+
+
+async def subproject_workflow_view(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = project.subproject(request.path_params["subproject_id"])
+    state = subproject_state(project, sub)
+    if request.method == "GET":
+        return JSONResponse(project_workflow.card(project, sub, state))
+    body = await _json(request)
+    current = project_workflow.workflow_of(sub)
+    if body.get("revision") is not None:
+        try:
+            revision = int(body["revision"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, detail={
+                "code": "invalid_revision", "message": "revision must be int"})
+        if revision != int(current.get("revision") or 0):
+            raise HTTPException(409, detail={
+                "code": "revision_conflict",
+                "message": "workflow was changed elsewhere; reload the board",
+                "revision": current.get("revision") or 0})
+    changes = {}
+    for key in ("stage_override", "archived", "due", "priority", "labels",
+                "blocked", "owner", "waiting_on"):
+        if key in body:
+            changes[key] = body[key]
+    derived = project_workflow.derive(project, sub, state)["stage"]
+    reason = str(body.get("reason") or "")
+    if "stage_override" in changes:
+        changes["stage_override"] = _validate_stage(
+            changes["stage_override"], derived, reason)
+        if changes["stage_override"] == "archived":
+            changes["stage_override"] = None
+            changes["archived"] = True
+        elif changes["stage_override"] and changes.get("archived") is None:
+            changes["archived"] = False
+    result = await asyncio.to_thread(
+        project_workflow.apply_change, project, sub, changes, reason=reason)
+    _audit(state, "stage_override",
+           stage=changes.get("stage_override") or derived,
+           archived=bool(result["workflow"].get("archived")), reason=reason,
+           revision=result["workflow"]["revision"])
+    return JSONResponse(project_workflow.card(project, sub, state))
+
+
+async def board_move(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    body = await _json(request)
+    moves = body.get("moves")
+    if not isinstance(moves, list) or not moves:
+        raise HTTPException(400, detail={
+            "code": "empty_moves", "message": "moves must be a non-empty list"})
+    cards = []
+    for move in moves:
+        if not isinstance(move, dict):
+            continue
+        project = _find_workspace(root, str(move.get("project_id") or ""))
+        sub = project.subproject(str(move.get("subproject_id") or ""))
+        state = subproject_state(project, sub)
+        derived = project_workflow.derive(project, sub, state)["stage"]
+        reason = str(move.get("reason") or "")
+        stage = _validate_stage(move.get("stage"), derived, reason)
+        changes = {"stage_override": stage}
+        if stage == "archived":
+            changes["stage_override"] = None
+            changes["archived"] = True
+        else:
+            changes["archived"] = False
+        result = await asyncio.to_thread(
+            project_workflow.apply_change, project, sub, changes,
+            reason=reason)
+        _audit(state, "stage_override", stage=stage or derived,
+               reason=reason, revision=result["workflow"]["revision"])
+        cards.append(project_workflow.card(project, sub, state))
+    return JSONResponse({"cards": cards})
 
 
 async def project_suggest(request: Request) -> JSONResponse:
@@ -1505,6 +1875,29 @@ def _all_tm(root: Path, project_id: str | None = None) -> list[dict]:
                 "tm": asdict(ref),
                 "units": [asdict(unit) for unit in read_tm(project, ref)],
             })
+        for sub in project.subprojects:
+            try:
+                state = subproject_state(project, sub)
+            except Exception:
+                continue
+            local = state.paths.assets / "tm.jsonl"
+            if not local.is_file():
+                continue
+            units = read_units(local)
+            if not units:
+                continue
+            result.append({
+                "project_id": project.id,
+                "project_name": project.name,
+                "tm": {
+                    "id": f"local-{sub.id}",
+                    "name": f"{sub.name} · 本机确认记忆",
+                    "level": "subproject",
+                    "path": str(local),
+                    "subproject_id": sub.id,
+                },
+                "units": [asdict(unit) for unit in units],
+            })
     return result
 
 
@@ -1530,6 +1923,73 @@ async def settings_view(request: Request) -> JSONResponse:
     return JSONResponse(public_settings(root))
 
 
+def _parse_models_payload(payload: dict) -> dict:
+    """Normalise ASR (``loaded``/``configured``) and MT router (``status``) shapes."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    data = data if isinstance(data, list) else []
+    loaded: list[str] = []
+    available: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("id") or item.get("name")
+        status = item.get("status")
+        state = status.get("value") if isinstance(status, dict) else None
+        if not name:
+            continue
+        if state == "loaded":
+            loaded.append(str(name))
+        else:
+            available.append(str(name))
+    current = payload.get("loaded") if isinstance(payload, dict) else None
+    if isinstance(current, str) and current:
+        loaded.append(current)
+    configured = payload.get("configured") if isinstance(payload, dict) else None
+    if isinstance(configured, dict) and configured.get("model"):
+        if not loaded:
+            loaded.append(str(configured["model"]))
+    return {
+        "loaded": sorted(set(loaded)),
+        "available": sorted(set(available)),
+        "count": len(data),
+    }
+
+
+def _service_models(url: str) -> dict:
+    if not url:
+        return {"loaded": [], "available": [], "count": 0}
+    try:
+        import json as _json
+        import urllib.request
+        with urllib.request.urlopen(url.rstrip("/") + "/v1/models",
+                                    timeout=1.5) as response:
+            payload = _json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return {"loaded": [], "available": [], "count": 0}
+    return _parse_models_payload(payload)
+
+
+def _service_hardware(url: str) -> dict:
+    """CPU/GPU/memory as reported by the service itself."""
+    if not url:
+        return {}
+    try:
+        import json as _json
+        import urllib.request
+        with urllib.request.urlopen(url.rstrip("/") + "/hardware",
+                                    timeout=2) as response:
+            payload = _json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "cpu": payload.get("cpu") or {},
+        "gpu": payload.get("gpu") or {},
+        "memory": payload.get("memory") or {},
+    }
+
+
 def _service_status(name: str, url: str) -> dict:
     if not url:
         return {"name": name, "url": "", "state": "not_configured"}
@@ -1537,17 +1997,21 @@ def _service_status(name: str, url: str) -> dict:
     try:
         import urllib.request
         with urllib.request.urlopen(health_url, timeout=2) as response:
-            return {"name": name, "url": url, "state": "ok",
-                    "http": response.status}
+            state = "ok"
+            status = response.status
     except Exception as exc:
         return {"name": name, "url": url, "state": "unreachable",
                 "detail": str(exc)[:200]}
+    return {
+        "name": name, "url": url, "state": state, "http": status,
+        "models": _service_models(url),
+        "hardware": _service_hardware(url),
+    }
 
 
 def _health_status(root: Path) -> dict:
-    system = _system_payload()
     settings = load_settings(root)
-    services = [{"name": "ncat-api", "url": "", "state": "ok"}]
+    services = []
     asr_url = (os.environ.get(CLOUD_ASR_URL) or ""
                if settings["asr"].get("mode") == "cloud"
                else os.environ.get(LOCAL_ASR_URL,
@@ -1557,11 +2021,7 @@ def _health_status(root: Path) -> dict:
               else os.environ.get(LOCAL_MT_URL, "http://127.0.0.1:8080"))
     services.append(_service_status("ASR", asr_url))
     services.append(_service_status("MT", mt_url))
-    return {
-        "cpu": system["cpu"], "gpu": system["gpu"],
-        "memory": system["memory"], "disk": system["disk"],
-        "services": services,
-    }
+    return {"collected_at": now_iso(), "services": services}
 
 
 async def health_status(request: Request) -> JSONResponse:
@@ -1577,6 +2037,9 @@ def _routes() -> list:
         Route("/api/v1/settings", settings_view, methods=["GET", "PATCH"]),
         Route("/api/v1/termbases", all_termbases),
         Route("/api/v1/tm", all_tm),
+        Route("/api/v1/tm/export.tmx", tm_export),
+        Route("/api/v1/board", board_view),
+        Route("/api/v1/board/move", board_move, methods=["POST"]),
         Route("/api/v1/settings", settings_view, methods=["GET", "PATCH"]),
         Route("/api/v1/system", system_info),
         Route("/api/v1/workspace", workspace),
@@ -1650,7 +2113,13 @@ def _routes() -> list:
         Route("/api/v1/projects/{project_id}/history", project_history,
               methods=["GET", "POST"]),
         Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/styles",
-              subproject_styles),
+              subproject_styles, methods=["GET", "PATCH"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/cues/{cue_id}/suggest-mt",
+              subproject_cue_mt, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/audit",
+              subproject_audit),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/workflow",
+              subproject_workflow_view, methods=["GET", "PATCH"]),
         Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/search",
               subproject_search),
         Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/qa",
@@ -1677,11 +2146,20 @@ async def _http_error(request: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse({"error": payload}, status_code=exc.status_code)
 
 
+class _NoCacheStatic(StaticFiles):
+    """本地单用户工具：静态资源不缓存，改完刷新就生效。"""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+
 def create_app(*, workspace: str | Path | None = None) -> Starlette:
     app = Starlette(routes=_routes())
     app.add_exception_handler(HTTPException, _http_error)
     app.state.workspace = str(workspace_root(workspace))
     if STATIC_DIR.is_dir():
-        app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True),
+        app.mount("/", _NoCacheStatic(directory=str(STATIC_DIR), html=True),
                   name="static")
     return app

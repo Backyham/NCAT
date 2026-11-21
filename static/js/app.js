@@ -18,6 +18,9 @@ const state = {
   busy: false,
   saveTimer: null,
   activeTab: "home",
+  screen: "home",
+  sidebarOpen: false,
+  sidebarPinned: false,
   jobs: [],
   system: null,
   pollTimer: null,
@@ -32,13 +35,33 @@ const state = {
   healthTimer: null,
   suggest: null,
   stylePayload: null,
+  providers: [],
+  currentProvider: null,
+  providerDialogEditing: false,
+  activeProviders: { asr: "", mt: "" },
+  providerModels: {},
+  providerModelNames: {},
+  providerModelTags: {},
+  lastModelValue: {},
+  clearKeys: {},
+  customProviderId: "",
+  customService: "",
+  customModelPrevious: "",
   styleName: "",
   styleFilledFor: "",
-  projectView: "board",
+  projectView: "overview",
+  listMode: "flat",
+  subOpen: false,
+  overview: null,
   board: null,
   expanded: new Set(),
-  collapsedLanes: new Set(),
+  collapsedCategories: new Set(),
+  editingCard: null,
 };
+
+const PROJECT_TABS = ["overview", "import", "transcribe", "mt", "text", "subtitle", "export", "transcript", "styles", "qa"];
+const GLOBAL_TABS = ["terms", "tm", "transcribe", "settings"];
+let routingReady = false;
 
 
 const ACTION_LABELS = {
@@ -251,7 +274,83 @@ function projectContext() {
   return state.project.project;
 }
 
+function parseRoute(hash) {
+  const raw = String(hash || "").replace(/^#/, "");
+  const [path, query = ""] = raw.split("?");
+  const parts = path.split("/").filter(Boolean)
+    .map((part) => {
+      try { return decodeURIComponent(part); } catch { return part; }
+    });
+  const params = new URLSearchParams(query);
+  if (!parts.length) return { kind: "home" };
+  if (parts[0] === "project" && parts[1]) {
+    if (parts[2] === "sub" && parts[3]) {
+      const tab = PROJECT_TABS.includes(parts[4]) ? parts[4] : "overview";
+      return { kind: "project", projectId: parts[1], subId: parts[3],
+               tab, view: "overview" };
+    }
+    const view = ["overview", "board", "list"].includes(parts[2])
+      ? parts[2] : "overview";
+    return {
+      kind: "project", projectId: parts[1], view, subId: "",
+      mode: params.get("mode") === "tree" ? "tree" : "flat",
+    };
+  }
+  if (GLOBAL_TABS.includes(parts[0])) {
+    return { kind: "global", tab: parts[0] };
+  }
+  return { kind: "home" };
+}
+
+function buildRoute() {
+  if (state.screen === "global" && GLOBAL_TABS.includes(state.activeTab)) {
+    return `#/${state.activeTab}`;
+  }
+  if (state.screen === "project" && state.projectId) {
+    if (state.subOpen && state.subId) {
+      return `#/project/${encodeURIComponent(state.projectId)}/sub/`
+        + `${encodeURIComponent(state.subId)}/${state.activeTab || "overview"}`;
+    }
+    const view = ["overview", "board", "list"].includes(state.projectView)
+      ? state.projectView : "overview";
+    const query = view === "list" && state.listMode === "tree"
+      ? "?mode=tree" : "";
+    return `#/project/${encodeURIComponent(state.projectId)}/${view}${query}`;
+  }
+  return "#/";
+}
+
+function syncRoute() {
+  if (!routingReady) return;
+  const route = buildRoute();
+  if (window.location.hash !== route) {
+    window.history.replaceState(null, "", route);
+  }
+}
+
+async function applyRoute(route) {
+  if (route.kind === "project") {
+    if (route.mode) state.listMode = route.mode;
+    await selectProject(route.projectId, {
+      subId: route.subId, view: route.view, tab: route.tab,
+    });
+    return;
+  }
+  if (route.kind === "global") {
+    switchTab(route.tab);
+    return;
+  }
+  showHome();
+}
+
 async function boot() {
+  const initialRoute = parseRoute(window.location.hash);
+  initSidebar();
+  window.addEventListener("hashchange", () => {
+    if (!routingReady) return;
+    applyRoute(parseRoute(window.location.hash))
+      .catch((error) => toast(error.message, true));
+  });
   bindTabs();
   bindHome();
   bindContext();
@@ -271,8 +370,6 @@ async function boot() {
   $("tm-export").addEventListener("click", () => {
     window.open("/api/v1/tm/export.tmx", "_blank");
   });
-  $("board-filter").addEventListener("input", () => renderBoard());
-  $("board-show-archived").addEventListener("change", () => renderBoard());
   document.querySelectorAll("#project-view-switch [data-project-view]")
     .forEach((button) => {
       button.addEventListener("click", () => {
@@ -283,6 +380,9 @@ async function boot() {
     if (event.key === "Enter") { event.preventDefault(); searchTm(); }
   });
   await loadWorkspace();
+  routingReady = true;
+  if (initialRoute.kind === "home") syncRoute();
+  else await applyRoute(initialRoute);
   await loadSettings();
   await loadHealth();
   state.pollTimer = setInterval(() => {
@@ -300,7 +400,7 @@ async function loadWorkspace() {
     state.project = null;
     state.subId = "";
     state.sub = null;
-    renderProjectSelect();
+    state.subOpen = false;
     renderProjectList();
     populateAssetFilters();
     renderAll();
@@ -329,25 +429,59 @@ function renderProjectSelect() {
   select.value = state.projectId || "";
 }
 
-async function selectProject(id) {
+async function selectProject(id, options = {}) {
   state.projectId = id;
-  if (!id) { state.project = null; state.subId = ""; state.sub = null; renderAll(); showHome(); return; }
+  if (!id) {
+    state.project = null;
+    state.subId = "";
+    state.sub = null;
+    state.subOpen = false;
+    renderAll();
+    showHome();
+    syncRoute();
+    return;
+  }
   setStatus("载入中");
   try {
     const project = await api.project(id);
     state.project = project;
     state.projectId = project.project.id;
     localStorage.setItem("ncat.project", state.projectId);
-    renderProjectSelect();
-    renderSubprojectSelect();
-    const remembered = localStorage.getItem(`ncat.sub.${state.projectId}`);
-    const sub = (project.subprojects || []).find((item) => item.id === remembered)
-      || project.subprojects[0];
-    state.subId = sub ? sub.id : "";
-    await loadSub();
-    setProjectView(state.projectView);
+    renderProjectList();
+    if (options.view && ["overview", "board", "list"].includes(options.view)) {
+      state.projectView = options.view;
+    }
+    if (options.subId) {
+      const sub = (project.subprojects || []).find(
+        (item) => item.id === options.subId);
+      if (sub) {
+        state.subId = sub.id;
+        state.subOpen = true;
+        state.activeTab = PROJECT_TABS.includes(options.tab)
+          ? options.tab : "overview";
+        await loadSub();
+        renderProjectHeader();
+        showSubprojectTab(state.activeTab);
+        syncRoute();
+        setStatus("就绪");
+        return;
+      }
+    }
+    state.subId = "";
+    state.sub = null;
+    state.subOpen = false;
+    renderProjectHeader();
+    setProjectView(state.projectView || "overview");
+    syncRoute();
     setStatus("就绪");
   } catch (error) {
+    state.projectId = "";
+    state.project = null;
+    state.subId = "";
+    state.sub = null;
+    state.subOpen = false;
+    showHome();
+    syncRoute();
     setStatus("加载失败", true);
     toast(error.message, true);
   }
@@ -355,6 +489,7 @@ async function selectProject(id) {
 
 function renderSubprojectSelect() {
   const select = $("subproject-select");
+  if (!select) return;
   select.replaceChildren();
   const none = document.createElement("option");
   none.value = "";
@@ -395,28 +530,139 @@ async function loadSub() {
   state.expanded = new Set();
   if (state.selectedId) state.expanded.add(cueStatus(state.cues[0]));
   state.dirty = false;
-  renderSubprojectSelect();
   renderAll();
   loadHistory().catch(() => {});
   loadStyles().catch(() => {});
   loadSuggestions().catch(() => {});
 }
 
+async function openSubproject(id) {
+  const sub = (state.project?.subprojects || []).find((item) => item.id === id);
+  if (!sub) return;
+  state.subId = id;
+  state.subOpen = true;
+  state.activeTab = "overview";
+  localStorage.setItem(`ncat.sub.${state.projectId}`, id);
+  await loadSub();
+  renderProjectHeader();
+  showSubprojectTab("overview");
+  syncRoute();
+}
+
+function setProjectView(view) {
+  state.projectView = ["overview", "board", "list"].includes(view)
+    ? view : "overview";
+  state.subOpen = false;
+  state.screen = "project";
+  document.querySelectorAll("#project-view-switch .view-btn").forEach((button) => {
+    button.classList.toggle("is-active",
+      button.dataset.projectView === state.projectView);
+  });
+  if (state.project) {
+    $("home-view").hidden = true;
+    $("project-shell").hidden = false;
+  }
+  $("project-tabs").hidden = true;
+  document.querySelectorAll("[data-project-panel]").forEach((panel) => {
+    panel.hidden = true;
+    panel.classList.remove("is-active");
+  });
+  $("project-overview").hidden = state.projectView !== "overview";
+  $("project-board").hidden = state.projectView !== "board";
+  $("project-list-view").hidden = state.projectView !== "list";
+  if (state.projectView === "overview") {
+    loadOverview().catch((error) => toast(error.message, true));
+  } else if (state.projectView === "board") {
+    loadBoard().catch(() => {});
+  } else {
+    renderSubprojectList();
+    syncRoute();
+  }
+  syncRoute();
+}
+
+function tabEnabled(name) {
+  const features = (state.project && state.project.features) || {};
+  const required = {
+    transcribe: "asr", mt: "mt", subtitle: "subtitle_edit",
+    export: "export", styles: "subtitle_edit", qa: "export",
+  }[name];
+  return !required || features[required] !== false;
+}
+
+function syncProjectTabs() {
+  document.querySelectorAll("#project-tabs [data-project-tab]")
+    .forEach((button) => {
+      const enabled = tabEnabled(button.dataset.projectTab);
+      button.hidden = !enabled;
+      button.disabled = !enabled;
+    });
+  const features = (state.project && state.project.features) || {};
+  const actionFeatures = {
+    ingest: "ffmpeg", align: "timing", segment: "segment",
+    translate: "mt", style: "subtitle_edit", render: "export",
+    "import-ass": "subtitle_edit",
+  };
+  document.querySelectorAll("[data-action]").forEach((button) => {
+    const required = actionFeatures[button.dataset.action];
+    button.hidden = Boolean(required && features[required] === false);
+  });
+}
+
+function showSubprojectTab(name) {
+  if (!tabEnabled(name)) name = "overview";
+  state.subOpen = true;
+  state.screen = "project";
+  state.activeTab = name;
+  $("home-view").hidden = true;
+  $("project-shell").hidden = false;
+  $("project-overview").hidden = true;
+  $("project-board").hidden = true;
+  $("project-list-view").hidden = true;
+  $("project-tabs").hidden = false;
+  document.querySelectorAll("[data-project-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.projectPanel !== name;
+    panel.classList.toggle("is-active", panel.dataset.projectPanel === name);
+  });
+  document.querySelectorAll("#project-tabs [data-project-tab]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.projectTab === name);
+  });
+  syncProjectTabs();
+  if (name === "overview") renderSubprojectDetail();
+  if (name === "text") renderTextEdit();
+  if (name === "transcript") renderTranscriptTab();
+  if (name === "styles") {
+    loadStyles().catch((error) => toast(error.message, true));
+    loadAudit().catch(() => {});
+  }
+  if (name === "qa") loadQa().catch((error) => toast(error.message, true));
+  requestAnimationFrame(() => {
+    renderCues();
+    renderEditor();
+  });
+  syncRoute();
+}
+
+function projectStatusText() {
+  const subs = (state.project && state.project.subprojects) || [];
+  const done = subs.filter((sub) => sub.done).length;
+  return `任务总数 ${subs.length} · 完成 ${done} · 未完成 ${subs.length - done}`;
+}
+
 function renderProjectHeader() {
+  const subtitle = $("header-subtitle");
   if (!state.project) {
     $("project-name").textContent = "项目";
     $("project-meta").textContent = "";
+    if (subtitle) {
+      subtitle.textContent = "Nick's Computer-Aided Translating Solution";
+    }
     return;
   }
-  const project = state.project.project;
-  const sub = currentSub();
-  $("project-name").textContent = project.name;
-  $("project-meta").textContent = [
-    project.client || "未填客户",
-    `${project.source_lang} → ${(project.target_langs || []).join(", ")}`,
-    sub ? `${sub.name} · ${kindLabel(sub.kind)}` : "无子项目",
-    `${state.project.counts.subprojects} 个子项目`,
-  ].filter(Boolean).join(" · ");
+  $("project-name").textContent = state.project.project.name;
+  $("project-meta").textContent = projectStatusText();
+  if (subtitle) subtitle.textContent = state.project.project.name;
+  syncProjectTabs();
 }
 
 function renderAll() {
@@ -450,7 +696,7 @@ function renderProjectList() {
     meta.className = "project-item-meta";
     meta.textContent = [
       project.client || "", `${project.counts.subprojects} 个子项目`,
-      `${project.counts.cues} 行`,
+      `${project.counts.done || 0} 完成`,
     ].filter(Boolean).join(" · ");
     button.append(name, meta);
     button.addEventListener("click", () => selectProject(project.id));
@@ -500,18 +746,14 @@ function renderProjectDetail() {
     main.append(name, detail);
     const actions = document.createElement("div");
     actions.className = "subproject-actions";
-    for (const [label, tab] of [["素材", "assets"], ["编辑", "editor"]]) {
-      const button = document.createElement("button");
-      button.className = "btn btn-quiet";
-      button.type = "button";
-      button.textContent = label;
-      button.addEventListener("click", async () => {
-        state.subId = sub.id;
-        await loadSub();
-        switchTab(tab);
-      });
-      actions.append(button);
-    }
+    const open = document.createElement("button");
+    open.className = "btn btn-quiet";
+    open.type = "button";
+    open.textContent = "打开";
+    open.addEventListener("click", () => {
+      openSubproject(sub.id).catch((error) => toast(error.message, true));
+    });
+    actions.append(open);
     row.append(main, actions);
     table.append(row);
   }
@@ -523,7 +765,6 @@ function renderContext() {
     ? [state.project.project.client, state.project.project.name,
        currentSub() ? currentSub().name : ""].filter(Boolean).join(" / ")
     : "未选择项目";
-  $("subproject-select").disabled = !state.project;
 }
 
 function renderEditorContext() {
@@ -848,6 +1089,12 @@ async function refreshSub() {
   const project = await api.project(state.projectId);
   state.project = project;
   await loadSub();
+  if (state.subOpen) {
+    renderProjectHeader();
+    renderSubprojectDetail();
+    if (state.activeTab === "text") renderTextEdit();
+    if (state.activeTab === "transcript") renderTranscriptTab();
+  }
 }
 
 async function runAction(action, body = {}) {
@@ -859,7 +1106,9 @@ async function runAction(action, body = {}) {
   state.busy = true;
   setStatus(`处理中：${actionLabel(action)}`);
   try {
-    const payload = await api.action(state.projectId, state.subId, action, body);
+    const payload = action === "import-ass"
+      ? await api.importAss(state.projectId, state.subId, body)
+      : await api.action(state.projectId, state.subId, action, body);
     await refreshSub();
     const detail = payload.ass || payload.render || payload.output;
     toast(detail ? `${actionLabel(action)}：${detail}`
@@ -972,6 +1221,580 @@ async function loadTm() {
   renderTm();
 }
 
+
+function parseProjectQuery(text) {
+  const filters = [];
+  const free = [];
+  const pattern = /(\w+)(>=|<=|=|:)(?:"([^"]*)"|(\S+))/g;
+  let match;
+  let rest = String(text || "").trim();
+  while ((match = pattern.exec(rest))) {
+    filters.push({
+      key: match[1].toLowerCase(),
+      op: match[2],
+      value: match[3] !== undefined ? match[3] : match[4],
+    });
+  }
+  const stripped = rest.replace(pattern, " ");
+  for (const word of stripped.split(/\s+/)) {
+    if (word) free.push(word.toLowerCase());
+  }
+  return { filters, free };
+}
+
+function subprojectMatches(sub, query, categoryName, laneName) {
+  const haystack = [
+    sub.name, sub.description || "",
+    ...(sub.subtasks || []).map((item) => item.title),
+    categoryName || "", laneName || "",
+  ].join(" ").toLowerCase();
+  for (const word of query.free) {
+    if (!haystack.includes(word)) return false;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  for (const filter of query.filters) {
+    const value = filter.value;
+    if (filter.key === "status") {
+      const wanted = value.toLowerCase();
+      if (wanted === "done" && !sub.done) return false;
+      if (wanted === "open" && sub.done) return false;
+    } else if (filter.key === "category") {
+      if ((categoryName || "").toLowerCase() !== value.toLowerCase()) return false;
+    } else if (filter.key === "due_within") {
+      if (sub.done || !sub.due) return false;
+      const days = parseInt(value, 10);
+      if (Number.isNaN(days)) return false;
+      const due = new Date(`${sub.due}T00:00:00`);
+      const now = new Date(`${today}T00:00:00`);
+      const limit = new Date(now.getTime() + days * 86400000);
+      if (due < now || due > limit) return false;
+    } else {
+      const field = filter.key === "created" ? sub.created_at
+        : filter.key === "completed" ? sub.completed_at
+          : filter.key === "due" ? sub.due : null;
+      if (field == null) return false;
+      const fieldDate = String(field).slice(0, 10);
+      if (filter.op.includes(">") && fieldDate < value) return false;
+      if (filter.op.includes("<") && fieldDate > value) return false;
+      if (filter.op === "=" && fieldDate !== value) return false;
+    }
+  }
+  return true;
+}
+
+function currentProjectQuery() {
+  return parseProjectQuery(($("project-search") || {}).value || "");
+}
+
+function categoryNameById(id) {
+  const category = ((state.project && state.project.categories) || [])
+    .find((item) => item.id === id);
+  return category ? category.name : "";
+}
+
+function laneNameById(categoryId, laneId) {
+  const category = ((state.project && state.project.categories) || [])
+    .find((item) => item.id === categoryId);
+  const lane = category && (category.lanes || []).find((item) => item.id === laneId);
+  return lane ? lane.name : "";
+}
+
+function filteredSubprojects() {
+  const query = currentProjectQuery();
+  return ((state.project && state.project.subprojects) || []).filter(
+    (sub) => subprojectMatches(
+      sub, query, categoryNameById(sub.category_id),
+      laneNameById(sub.category_id, sub.lane_id)));
+}
+
+async function loadOverview() {
+  if (!state.projectId) return;
+  state.overview = await api.overview(state.projectId);
+  renderOverview();
+}
+
+function renderOverview() {
+  const data = state.overview;
+  if (!data) return;
+  const summary = $("overview-summary");
+  summary.replaceChildren();
+  const title = document.createElement("h2");
+  title.textContent = data.project.name;
+  const totals = document.createElement("div");
+  totals.className = "project-meta";
+  totals.textContent = `任务 ${data.totals.subprojects} · 完成 ${data.totals.done}`
+    + ` · 未完成 ${data.totals.open} · 逾期 ${data.totals.overdue}`;
+  summary.append(title, totals);
+  const categories = $("overview-categories");
+  categories.replaceChildren();
+  for (const category of data.categories) {
+    const card = document.createElement("section");
+    card.className = "panel";
+    const head = document.createElement("div");
+    head.className = "panel-head";
+    const name = document.createElement("span");
+    name.textContent = category.name;
+    const count = document.createElement("span");
+    count.className = "panel-count";
+    count.textContent = `${category.done}/${category.total}`;
+    head.append(name, count);
+    card.append(head);
+    for (const lane of category.lanes) {
+      const row = document.createElement("div");
+      row.className = "stat-row";
+      row.textContent = `${lane.name} · ${lane.done}/${lane.total}`
+        + (lane.overdue ? ` · 逾期 ${lane.overdue}` : "");
+      card.append(row);
+    }
+    categories.append(card);
+  }
+  const activity = $("activity-list");
+  activity.replaceChildren();
+  if (!(data.activity || []).length) {
+    activity.textContent = "暂无动态。";
+  }
+  for (const event of data.activity || []) {
+    const row = document.createElement("div");
+    row.className = "activity-row";
+    const time = document.createElement("span");
+    time.className = "activity-time";
+    time.textContent = event.at ? new Date(event.at).toLocaleString() : "—";
+    const text = document.createElement("span");
+    text.textContent = activityLabel(event);
+    row.append(time, text);
+    activity.append(row);
+  }
+}
+
+function activityLabel(event) {
+  const labels = {
+    subproject_added: "添加子项目", subproject_deleted: "删除子项目",
+    subproject_moved: "移动泳道", subtask_added: "添加子任务",
+    subtask_deleted: "删除子任务", subtask_completed: "完成子任务",
+    subtask_uncompleted: "取消完成子任务", category_added: "添加分类",
+    category_deleted: "删除分类", lane_added: "添加泳道",
+    lane_deleted: "删除泳道",
+  };
+  const base = labels[event.type] || event.type;
+  const name = event.name || event.title || "";
+  return name ? `${base}：${name}` : base;
+}
+
+async function loadBoard() {
+  if (!state.projectId) {
+    state.board = null;
+    renderBoard();
+    return;
+  }
+  try {
+    state.board = await api.projectBoard(state.projectId);
+  } catch (error) {
+    state.board = null;
+    toast(error.message, true);
+  }
+  renderBoard();
+}
+
+function boardCardView(card) {
+  const element = document.createElement("article");
+  element.className = "board-card";
+  element.draggable = true;
+  const head = document.createElement("div");
+  head.className = "board-card-head";
+  const name = document.createElement("strong");
+  name.textContent = card.name;
+  head.append(name);
+  if (card.done) {
+    const badge = document.createElement("span");
+    badge.className = "board-badge";
+    badge.textContent = "完成";
+    head.append(badge);
+  }
+  element.append(head);
+  const meta = document.createElement("div");
+  meta.className = "board-card-meta";
+  meta.textContent = `${card.subtasks ? card.subtasks.done : 0}/`
+    + `${card.subtasks ? card.subtasks.total : 0} 子任务`;
+  element.append(meta);
+  if (card.due) {
+    const due = document.createElement("div");
+    due.className = "board-card-foot";
+    due.textContent = `截止 ${card.due}`;
+    element.append(due);
+  }
+  element.addEventListener("dragstart", (event) => {
+    event.dataTransfer.setData("text/plain", JSON.stringify({
+      id: card.subproject_id, category_id: card.category_id,
+      lane_id: card.lane_id,
+    }));
+    event.dataTransfer.effectAllowed = "move";
+  });
+  element.addEventListener("click", () => {
+    openSubproject(card.subproject_id).catch(
+      (error) => toast(error.message, true));
+  });
+  return element;
+}
+
+function renderBoard() {
+  const root = $("board");
+  if (!root) return;
+  root.replaceChildren();
+  const data = state.board;
+  if (!data) {
+    root.textContent = "正在加载看板…";
+    return;
+  }
+  const query = currentProjectQuery();
+  const allowed = new Set(((state.project && state.project.subprojects) || [])
+    .filter((sub) => subprojectMatches(
+      sub, query, categoryNameById(sub.category_id),
+      laneNameById(sub.category_id, sub.lane_id)))
+    .map((sub) => sub.id));
+  for (const category of data.categories || []) {
+    const section = document.createElement("section");
+    section.className = "board-category";
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "board-category-head";
+    const collapsed = state.collapsedCategories.has(category.id);
+    head.textContent = `${collapsed ? "▸" : "▾"} ${category.name}`;
+    head.addEventListener("click", () => {
+      if (collapsed) state.collapsedCategories.delete(category.id);
+      else state.collapsedCategories.add(category.id);
+      renderBoard();
+    });
+    section.append(head);
+    if (!collapsed) {
+      const grid = document.createElement("div");
+      grid.className = "board-grid";
+      grid.style.gridTemplateColumns = `repeat(${category.lanes.length}, 17rem)`;
+      for (const lane of category.lanes) {
+        const column = document.createElement("div");
+        column.className = "board-lane";
+        const laneHead = document.createElement("div");
+        laneHead.className = "board-head-cell";
+        const count = lane.cards.filter((card) => allowed.has(card.subproject_id)).length;
+        laneHead.textContent = `${lane.name} · ${count}`;
+        column.append(laneHead);
+        const cell = document.createElement("div");
+        cell.className = "board-cell";
+        for (const card of lane.cards.filter(
+          (item) => allowed.has(item.subproject_id))) {
+          cell.append(boardCardView(card));
+        }
+        if (!cell.children.length) {
+          const empty = document.createElement("div");
+          empty.className = "board-column-empty";
+          empty.textContent = "—";
+          cell.append(empty);
+        }
+        cell.addEventListener("dragover", (event) => {
+          event.preventDefault();
+          cell.classList.add("is-drop");
+        });
+        cell.addEventListener("dragleave", () => cell.classList.remove("is-drop"));
+        cell.addEventListener("drop", (event) => {
+          event.preventDefault();
+          cell.classList.remove("is-drop");
+          let payload = null;
+          try {
+            payload = JSON.parse(event.dataTransfer.getData("text/plain"));
+          } catch {}
+          if (!payload || payload.category_id !== category.id) {
+            toast("不能跨分类移动，请在子项目详情修改分类", true);
+            return;
+          }
+          moveCard(payload.id, category.id, lane.id).catch(
+            (error) => toast(error.message, true));
+        });
+        column.append(cell);
+        grid.append(column);
+      }
+      section.append(grid);
+    }
+    root.append(section);
+  }
+  if (!(data.categories || []).length) {
+    const empty = document.createElement("div");
+    empty.className = "board-empty";
+    empty.textContent = "还没有分类/泳道，请先在项目设置 → 编辑看板中创建。";
+    root.append(empty);
+  }
+}
+
+async function moveCard(subprojectId, categoryId, laneId) {
+  if (!state.projectId) return;
+  try {
+    await api.patchWorkflow(state.projectId, subprojectId, {
+      category_id: categoryId, lane_id: laneId,
+    });
+    await loadBoard();
+    if (state.projectView === "overview") await loadOverview();
+  } catch (error) {
+    toast(error.message, true);
+    await loadBoard();
+  }
+}
+
+function renderSubprojectList() {
+  const root = $("subproject-list-view");
+  if (!root) return;
+  const toggle = $("list-mode-toggle");
+  if (toggle) {
+    toggle.textContent = state.listMode === "flat" ? "层级" : "平铺";
+  }
+  root.replaceChildren();
+  const subs = filteredSubprojects();
+  if (!subs.length) {
+    root.textContent = "没有匹配的子项目。";
+    return;
+  }
+  if (state.listMode === "tree") {
+    for (const category of state.project.categories || []) {
+      const categorySubs = subs.filter((sub) => sub.category_id === category.id);
+      if (!categorySubs.length) continue;
+      const section = document.createElement("section");
+      section.className = "list-tree-category";
+      const head = document.createElement("div");
+      head.className = "list-tree-head";
+      head.textContent = category.name;
+      section.append(head);
+      for (const lane of category.lanes || []) {
+        const laneSubs = categorySubs.filter((sub) => sub.lane_id === lane.id);
+        if (!laneSubs.length) continue;
+        const laneHead = document.createElement("div");
+        laneHead.className = "list-tree-lane";
+        laneHead.textContent = lane.name;
+        section.append(laneHead);
+        for (const sub of laneSubs) section.append(subprojectRow(sub));
+      }
+      root.append(section);
+    }
+    return;
+  }
+  for (const sub of subs) root.append(subprojectRow(sub));
+}
+
+function subprojectRow(sub) {
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "subproject-row";
+  const main = document.createElement("div");
+  const name = document.createElement("strong");
+  name.textContent = sub.name;
+  const meta = document.createElement("div");
+  meta.className = "project-meta";
+  meta.textContent = [
+    categoryNameById(sub.category_id),
+    laneNameById(sub.category_id, sub.lane_id),
+    sub.done ? "完成" : "未完成",
+    sub.due ? `截止 ${sub.due}` : "",
+  ].filter(Boolean).join(" · ");
+  main.append(name, meta);
+  row.append(main);
+  row.addEventListener("click", () => {
+    openSubproject(sub.id).catch((error) => toast(error.message, true));
+  });
+  return row;
+}
+
+function renderSubprojectDetail() {
+  const sub = state.sub;
+  if (!sub) return;
+  $("detail-name").value = sub.name || "";
+  $("detail-description").value = sub.description || "";
+  $("detail-due").value = sub.due || "";
+  $("detail-done").checked = Boolean(sub.done);
+  const categorySelect = $("detail-category");
+  categorySelect.replaceChildren();
+  for (const category of state.project.categories || []) {
+    const option = document.createElement("option");
+    option.value = category.id;
+    option.textContent = category.name;
+    categorySelect.append(option);
+  }
+  categorySelect.value = sub.category_id || "";
+  renderDetailLanes(sub.category_id, sub.lane_id);
+  const list = $("detail-subtasks");
+  list.replaceChildren();
+  $("detail-subtask-count").textContent = String((sub.subtasks || []).length);
+  for (const task of sub.subtasks || []) {
+    const row = document.createElement("div");
+    row.className = "subtask-row";
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = Boolean(task.done);
+    check.addEventListener("change", () => {
+      api.patchSubtask(state.projectId, state.subId, task.id,
+        { done: check.checked })
+        .then(() => refreshSub())
+        .catch((error) => toast(error.message, true));
+    });
+    const title = document.createElement("input");
+    title.value = task.title;
+    title.className = "subtask-title";
+    title.addEventListener("change", () => {
+      api.patchSubtask(state.projectId, state.subId, task.id,
+        { title: title.value })
+        .then(() => refreshSub())
+        .catch((error) => toast(error.message, true));
+    });
+    const remove = document.createElement("button");
+    remove.className = "btn btn-quiet";
+    remove.type = "button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      api.deleteSubtask(state.projectId, state.subId, task.id)
+        .then(() => refreshSub())
+        .catch((error) => toast(error.message, true));
+    });
+    row.append(check, title, remove);
+    list.append(row);
+  }
+  renderDetailLinks(sub);
+  renderDetailComments(sub);
+  renderDetailAttachments(sub);
+}
+
+function renderDetailLanes(categoryId, selected) {
+  const select = $("detail-lane");
+  select.replaceChildren();
+  const category = (state.project.categories || [])
+    .find((item) => item.id === categoryId);
+  for (const lane of (category && category.lanes) || []) {
+    const option = document.createElement("option");
+    option.value = lane.id;
+    option.textContent = lane.name;
+    select.append(option);
+  }
+  select.value = selected || "";
+}
+
+function renderDetailLinks(sub) {
+  const internal = $("detail-internal-links");
+  internal.replaceChildren();
+  for (const link of sub.internal_links || []) {
+    const target = (state.project.subprojects || [])
+      .find((item) => item.id === link.target_subproject_id);
+    const row = document.createElement("div");
+    row.className = "link-row";
+    const label = document.createElement("span");
+    label.textContent = `${link.label || target?.name || link.target_subproject_id}`;
+    const remove = document.createElement("button");
+    remove.className = "btn btn-quiet";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      api.deleteInternalLink(state.projectId, state.subId, link.id)
+        .then(() => refreshSub()).catch((error) => toast(error.message, true));
+    });
+    row.append(label, remove);
+    internal.append(row);
+  }
+  const targetSelect = $("new-internal-target");
+  targetSelect.replaceChildren();
+  for (const item of state.project.subprojects || []) {
+    if (item.id === state.subId) continue;
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = item.name;
+    targetSelect.append(option);
+  }
+  const external = $("detail-external-links");
+  external.replaceChildren();
+  for (const link of sub.external_links || []) {
+    const row = document.createElement("div");
+    row.className = "link-row";
+    const anchor = document.createElement("a");
+    anchor.href = link.url;
+    anchor.target = "_blank";
+    anchor.rel = "noreferrer";
+    anchor.textContent = link.label || link.url;
+    const remove = document.createElement("button");
+    remove.className = "btn btn-quiet";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      api.deleteExternalLink(state.projectId, state.subId, link.id)
+        .then(() => refreshSub()).catch((error) => toast(error.message, true));
+    });
+    row.append(anchor, remove);
+    external.append(row);
+  }
+}
+
+function renderDetailAttachments(sub) {
+  const root = $("detail-attachments");
+  root.replaceChildren();
+  for (const item of sub.attachments || []) {
+    const row = document.createElement("div");
+    row.className = "link-row";
+    const link = document.createElement("a");
+    link.href = api.attachmentUrl(state.projectId, state.subId, item.id);
+    link.textContent = `${item.name} (${Math.round(item.size / 1024)} KB)`;
+    const remove = document.createElement("button");
+    remove.className = "btn btn-quiet";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      api.deleteAttachment(state.projectId, state.subId, item.id)
+        .then(() => refreshSub()).catch((error) => toast(error.message, true));
+    });
+    row.append(link, remove);
+    root.append(row);
+  }
+}
+
+function renderDetailComments(sub) {
+  const root = $("detail-comments");
+  root.replaceChildren();
+  for (const comment of sub.comments || []) {
+    const row = document.createElement("div");
+    row.className = "comment-row";
+    const body = document.createElement("div");
+    body.textContent = comment.body;
+    const time = document.createElement("span");
+    time.className = "project-meta";
+    time.textContent = comment.created_at
+      ? new Date(comment.created_at).toLocaleString() : "";
+    const remove = document.createElement("button");
+    remove.className = "btn btn-quiet";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      api.deleteComment(state.projectId, state.subId, comment.id)
+        .then(() => refreshSub()).catch((error) => toast(error.message, true));
+    });
+    row.append(body, time, remove);
+    root.append(row);
+  }
+}
+
+function renderTextEdit() {
+  const body = $("text-segment-table").querySelector("tbody");
+  if (!body) return;
+  body.replaceChildren();
+  for (const segment of state.segments || []) {
+    const row = document.createElement("tr");
+    const index = document.createElement("td");
+    index.textContent = String((state.segments.indexOf(segment) + 1));
+    const source = document.createElement("td");
+    source.textContent = segment.source;
+    const targetCell = document.createElement("td");
+    const target = document.createElement("input");
+    target.value = segment.target || "";
+    target.addEventListener("change", () => {
+      api.patchSegment(state.projectId, state.subId, segment.id,
+        { target: target.value })
+        .then(() => refreshSub())
+        .catch((error) => toast(error.message, true));
+    });
+    targetCell.append(target);
+    const status = document.createElement("td");
+    status.textContent = String(segment.status || "");
+    row.append(index, source, targetCell, status);
+    body.append(row);
+  }
+}
+
+
 async function loadHealth() {
   try {
     state.health = await api.healthStatus();
@@ -1029,13 +1852,18 @@ function renderServiceCard(service) {
     head.append(url);
   }
   card.append(head);
+  if (service.state === "ok" && service.detail) {
+    hwText(card, service.detail, "hw-line health-note");
+  }
   const hardware = service.hardware || {};
   const cpu = hardware.cpu || {};
   if (service.state !== "ok" || !Object.keys(cpu).length) {
     const detail = service.state === "unreachable"
       ? `不可达${service.detail ? "：" + service.detail : ""}`
-      : service.state === "not_configured" ? "未配置" : "无硬件数据";
-    hwText(card, detail);
+      : service.state === "not_configured" ? "未配置"
+        : service.state === "ignored" ? "已忽略运行状态检查" : "无硬件数据";
+    if (!(service.state === "ok" && service.detail)) hwText(card, detail);
+    appendHealthIgnore(card, service);
     return card;
   }
   if (cpu.usage_pct != null) card.append(hwBar(cpu.usage_pct));
@@ -1077,7 +1905,41 @@ function renderServiceCard(service) {
   } else if (models.count) {
     hwText(card, `可用模型 ${models.count} 个（未加载）`, "hw-line hw-sub");
   }
+  appendHealthIgnore(card, service);
   return card;
+}
+
+function appendHealthIgnore(card, service) {
+  if (!service.provider_id) return;
+  if (!(service.health_supported === false
+        || service.state === "ignored"
+        || service.state === "unreachable")) return;
+  const button = document.createElement("button");
+  button.className = "btn btn-quiet health-ignore";
+  button.type = "button";
+  button.textContent = service.state === "ignored" ? "恢复检查" : "忽略检查";
+  button.addEventListener("click", () => {
+    toggleHealthIgnore(service, service.state !== "ignored");
+  });
+  card.append(button);
+}
+
+async function toggleHealthIgnore(service, ignore) {
+  try {
+    const settings = await api.settings();
+    const providers = (settings.providers || []).map((provider) =>
+      provider.id === service.provider_id
+        ? { ...provider, ignore_health: ignore } : provider);
+    await api.saveSettings({
+      providers,
+      asr: { active_provider_id: settings.asr?.active_provider_id || "" },
+      mt: { active_provider_id: settings.mt?.active_provider_id || "" },
+    });
+    await loadSettings();
+    await loadHealth();
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function renderHealth() {
@@ -1088,163 +1950,19 @@ function renderHealth() {
   for (const service of services) root.append(renderServiceCard(service));
   $("health-updated").textContent = health.collected_at
     ? `更新于 ${new Date(health.collected_at).toLocaleTimeString()}` : "—";
-  const down = services.some((service) => service.state === "unreachable");
-  const hot = services.some((service) => {
+  const configured = services.filter(
+    (service) => service.state !== "not_configured"
+      && service.state !== "ignored");
+  const down = configured.some(
+    (service) => service.state === "unreachable");
+  const hot = configured.some((service) => {
     const gpu = (service.hardware || {}).gpu || {};
     return gpu.temperature_c >= 85
       || (gpu.memory_total_mb && gpu.memory_used_mb / gpu.memory_total_mb >= 0.95);
   });
-  $("health-dot").className = "health-dot "
-    + (down ? "is-down" : hot ? "is-warn" : "is-ok");
+  const tone = !configured.length ? "" : down ? "is-down" : hot ? "is-warn" : "is-ok";
+  $("health-dot").className = "health-dot" + (tone ? ` ${tone}` : "");
 }
-
-
-/* ------------------------------------------------------- 建议面板 */
-
-function insertTextAtCaret(node, text) {
-  node.focus();
-  const selection = window.getSelection();
-  if (!selection.rangeCount || !node.contains(selection.anchorNode)) {
-    focusEnd(node);
-  }
-  document.execCommand("insertText", false, text);
-}
-
-function applySuggestion(text, replace) {
-  const node = $("target-text");
-  if (!text || node.contentEditable !== "true") return;
-  if (replace || !readTagEditor(node).trim()) {
-    renderTagEditor(node, text);
-    state.editorLastGood.target = text;
-  } else {
-    insertTextAtCaret(node, text);
-  }
-  markDirty();
-}
-
-async function loadSuggestions() {
-  const cue = currentCue();
-  if (!cue || !state.project || !state.subId) {
-    state.suggest = null;
-    renderSuggestions();
-    return;
-  }
-  const query = (visibleText(cue.source_text)
-    || visibleText(cue.target_text)).trim();
-  if (!query) {
-    state.suggest = { query: "", tm: [], terms: [], mt: null };
-    renderSuggestions();
-    return;
-  }
-  try {
-    const payload = await api.suggest(state.projectId, state.subId, query);
-    const previous = state.suggest && state.suggest.query === query
-      ? state.suggest.mt : null;
-    state.suggest = { ...payload, mt: previous };
-  } catch (error) {
-    state.suggest = null;
-  }
-  renderSuggestions();
-}
-
-function renderSuggestions() {
-  const root = $("suggest-list");
-  if (!root) return;
-  root.replaceChildren();
-  const data = state.suggest;
-  if (!data) {
-    $("suggest-state").textContent = "—";
-    return;
-  }
-  const tm = data.tm || [];
-  const terms = data.terms || [];
-  $("suggest-state").textContent =
-    `记忆库 ${tm.length} · 术语 ${terms.length}` + (data.mt ? " · MT" : "");
-  for (const hit of tm.slice(0, 5)) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "suggest-row";
-    const score = document.createElement("span");
-    score.className = "suggest-score";
-    score.textContent = `${Math.round(Number(hit.score) * 100)}%`;
-    const body = document.createElement("span");
-    body.className = "suggest-body";
-    const source = document.createElement("span");
-    source.className = "suggest-source";
-    source.textContent = hit.source;
-    const target = document.createElement("span");
-    target.className = "suggest-target";
-    target.textContent = hit.target;
-    body.append(source, target);
-    row.append(score, body);
-    row.title = "点击插入，Shift+点击替换";
-    row.addEventListener("click", (event) => {
-      event.preventDefault();
-      applySuggestion(hit.target, event.shiftKey);
-    });
-    root.append(row);
-  }
-  for (const term of terms) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "term-chip"
-      + (term.forbidden ? " is-forbidden" : "")
-      + (term.status === "deprecated" ? " is-deprecated" : "");
-    chip.textContent = `${term.source} → ${term.target}`;
-    chip.title = term.forbidden ? "禁译词"
-      : `状态：${term.status || "preferred"}`;
-    chip.addEventListener("click", () => applySuggestion(term.target, false));
-    root.append(chip);
-  }
-  if (data.mt && data.mt.target) {
-    const row = document.createElement("button");
-    row.type = "button";
-    row.className = "suggest-row is-mt";
-    const score = document.createElement("span");
-    score.className = "suggest-score";
-    score.textContent = "MT";
-    const body = document.createElement("span");
-    body.className = "suggest-body";
-    const target = document.createElement("span");
-    target.className = "suggest-target";
-    target.textContent = data.mt.target;
-    body.append(target);
-    row.append(score, body);
-    row.title = `模型 ${data.mt.model || "本地"}；点击插入`;
-    row.addEventListener("click", (event) => {
-      event.preventDefault();
-      applySuggestion(data.mt.target, event.shiftKey);
-    });
-    root.append(row);
-  }
-  if (!tm.length && !terms.length && !(data.mt && data.mt.target)) {
-    const empty = document.createElement("div");
-    empty.className = "suggest-empty";
-    empty.textContent = "没有匹配的记忆库或术语。";
-    root.append(empty);
-  }
-}
-
-async function requestMtSuggestion() {
-  const cue = currentCue();
-  if (!cue || !state.project || !state.subId) {
-    toast("请先选择字幕行", true);
-    return;
-  }
-  $("suggest-state").textContent = "请求 MT…";
-  try {
-    const payload = await api.suggestMt(state.projectId, state.subId, cue.id);
-    state.suggest = state.suggest || { tm: [], terms: [] };
-    state.suggest.mt = payload;
-    renderSuggestions();
-    if (!payload.target) toast("MT 返回为空", true);
-  } catch (error) {
-    toast(error.message, true);
-    renderSuggestions();
-  }
-}
-
-/* ------------------------------------------------------- 分段状态 */
 
 function segmentForCue(cue) {
   if (!cue || !cue.segment_id) return null;
@@ -1440,313 +2158,154 @@ function searchTm() {
 }
 
 
-/* ------------------------------------------------------------- 看板视图 */
 
-function stageLabel(key) {
-  const columns = (state.board && state.board.columns) || [];
-  const column = columns.find((item) => item.key === key);
-  return column ? column.label : key;
+/* ------------------------------------------------------- 建议面板 */
+
+function insertTextAtCaret(node, text) {
+  node.focus();
+  const selection = window.getSelection();
+  if (!selection.rangeCount || !node.contains(selection.anchorNode)) {
+    focusEnd(node);
+  }
+  document.execCommand("insertText", false, text);
 }
 
-function boardCard(card) {
-  const element = document.createElement("article");
-  element.className = "board-card";
-  element.draggable = true;
-  element.dataset.subprojectId = card.subproject_id;
-  element.dataset.stage = card.stage;
-  element.dataset.kind = card.kind || "video";
-  const updated = card.updated_at ? new Date(card.updated_at).getTime() : 0;
-  if (updated && Date.now() - updated < 24 * 3600 * 1000) {
-    element.classList.add("is-recent");
+function applySuggestion(text, replace) {
+  const node = $("target-text");
+  if (!text || node.contentEditable !== "true") return;
+  if (replace || !readTagEditor(node).trim()) {
+    renderTagEditor(node, text);
+    state.editorLastGood.target = text;
+  } else {
+    insertTextAtCaret(node, text);
   }
-  const head = document.createElement("div");
-  head.className = "board-card-head";
-  const name = document.createElement("strong");
-  name.textContent = card.name;
-  head.append(name);
-  if (card.stage_source === "manual") {
-    const badge = document.createElement("span");
-    badge.className = "board-badge";
-    badge.textContent = "手动";
-    badge.title = `自动推导为「${stageLabel(card.derived_stage)}」`;
-    head.append(badge);
-  }
-  element.append(head);
-  const meta = document.createElement("div");
-  meta.className = "board-card-meta";
-  meta.textContent = `${kindLabel(card.kind)} · ${(card.langs || []).join(" → ")}`;
-  element.append(meta);
-  const total = card.evidence ? card.evidence.segments : 0;
-  const approved = card.evidence ? card.evidence.approved : 0;
-  const bar = document.createElement("div");
-  bar.className = "board-progress";
-  const fill = document.createElement("i");
-  fill.style.width = `${total ? Math.round(100 * approved / total) : 0}%`;
-  bar.append(fill);
-  element.append(bar);
-  const evidence = document.createElement("div");
-  evidence.className = "board-card-evidence";
-  const parts = [`已确认 ${approved}/${total}`];
-  if (card.evidence && card.evidence.qa_open) {
-    parts.push(`QA 待办 ${card.evidence.qa_open}`);
-  }
-  if (card.evidence && card.evidence.cues) {
-    parts.push(`${card.evidence.cues} 行`);
-  }
-  evidence.textContent = parts.join(" · ");
-  element.append(evidence);
-  const footer = [];
-  if (card.workflow && card.workflow.due) footer.push(`截止 ${card.workflow.due}`);
-  if (card.workflow && card.workflow.priority
-      && card.workflow.priority !== "normal") {
-    footer.push(card.workflow.priority === "high" ? "高优先级" : "低优先级");
-  }
-  if (card.workflow && card.workflow.blocked
-      && card.workflow.blocked.reason) {
-    footer.push(`受阻：${card.workflow.blocked.reason}`);
-  }
-  if (footer.length) {
-    const foot = document.createElement("div");
-    foot.className = "board-card-foot";
-    const overdue = card.workflow && card.workflow.due
-      && new Date(card.workflow.due).getTime() < Date.now()
-      && !["delivered", "archived"].includes(card.stage);
-    foot.classList.toggle("is-overdue", Boolean(overdue));
-    foot.textContent = footer.join(" · ");
-    element.append(foot);
-  }
-  element.addEventListener("dragstart", (event) => {
-    event.dataTransfer.setData("text/plain",
-      JSON.stringify({ id: card.subproject_id, kind: card.kind || "video" }));
-    event.dataTransfer.effectAllowed = "move";
-    element.classList.add("is-dragging");
-  });
-  element.addEventListener("dragend", () => {
-    element.classList.remove("is-dragging");
-  });
-  element.addEventListener("click", () => {
-    openSubproject(card.subproject_id).catch((error) => toast(error.message, true));
-  });
-  return element;
+  markDirty();
 }
 
-async function loadBoard() {
-  if (!state.projectId) {
-    state.board = null;
-    renderBoard();
+async function loadSuggestions() {
+  const cue = currentCue();
+  if (!cue || !state.project || !state.subId) {
+    state.suggest = null;
+    renderSuggestions();
+    return;
+  }
+  const query = (visibleText(cue.source_text)
+    || visibleText(cue.target_text)).trim();
+  if (!query) {
+    state.suggest = { query: "", tm: [], terms: [], mt: null };
+    renderSuggestions();
     return;
   }
   try {
-    state.board = await api.board(state.projectId);
+    const payload = await api.suggest(state.projectId, state.subId, query);
+    const previous = state.suggest && state.suggest.query === query
+      ? state.suggest.mt : null;
+    state.suggest = { ...payload, mt: previous };
   } catch (error) {
-    state.board = null;
-    toast(error.message, true);
+    state.suggest = null;
   }
-  renderBoard();
+  renderSuggestions();
 }
 
-function boardCardMatches(card, query) {
-  if (!query) return true;
-  const haystack = [card.name, card.kind, ...(card.langs || []),
-                    ...((card.workflow && card.workflow.labels) || [])]
-    .join(" ").toLowerCase();
-  return haystack.includes(query);
-}
-
-const LANE_LABELS = { video: "视频", text: "文本", other: "其他" };
-
-function laneName(kind) {
-  return LANE_LABELS[kind] || (kind ? kind : "其他");
-}
-
-function renderBoard() {
-  const root = $("board");
+function renderSuggestions() {
+  const root = $("suggest-list");
   if (!root) return;
   root.replaceChildren();
-  const data = state.board;
+  const data = state.suggest;
   if (!data) {
-    const loading = document.createElement("div");
-    loading.className = "board-empty";
-    loading.textContent = "正在加载看板…";
-    root.append(loading);
+    $("suggest-state").textContent = "—";
     return;
   }
-  const query = (($("board-filter") || {}).value || "").trim().toLowerCase();
-  const showArchived = !$("board-show-archived")
-    || $("board-show-archived").checked;
-  const columns = data.columns || [];
-  const cards = (data.cards || []).filter((card) => {
-    if (!showArchived && card.stage === "archived") return false;
-    return boardCardMatches(card, query);
-  });
-  const kinds = [];
-  for (const card of cards) {
-    const kind = card.kind || "other";
-    if (!kinds.includes(kind)) kinds.push(kind);
-  }
-  if (!kinds.length) kinds.push("video");
-  const grid = document.createElement("div");
-  grid.className = "board-grid";
-  grid.style.gridTemplateColumns = `5.5rem repeat(${columns.length}, 17rem)`;
-
-  const spacer = document.createElement("div");
-  spacer.className = "board-corner";
-  spacer.textContent = "泳道";
-  grid.append(spacer);
-  for (const column of columns) {
-    const head = document.createElement("div");
-    head.className = "board-head-cell";
-    const label = document.createElement("span");
-    label.textContent = column.label;
-    const count = document.createElement("span");
-    count.textContent = String(cards.filter(
-      (card) => card.stage === column.key).length);
-    head.append(label, count);
-    grid.append(head);
-  }
-
-  for (const kind of kinds) {
-    const laneCards = cards.filter((card) => (card.kind || "other") === kind);
-    const laneKey = kind || "other";
-    const collapsed = state.collapsedLanes.has(laneKey);
-    const laneHead = document.createElement("button");
-    laneHead.type = "button";
-    laneHead.className = "board-lane-head";
-    laneHead.textContent = `${collapsed ? "▸" : "▾"} ${laneName(kind)}`;
-    laneHead.title = collapsed ? "展开泳道" : "收起泳道";
-    laneHead.addEventListener("click", () => {
-      if (collapsed) state.collapsedLanes.delete(laneKey);
-      else state.collapsedLanes.add(laneKey);
-      renderBoard();
+  const tm = data.tm || [];
+  const terms = data.terms || [];
+  $("suggest-state").textContent =
+    `记忆库 ${tm.length} · 术语 ${terms.length}` + (data.mt ? " · MT" : "");
+  for (const hit of tm.slice(0, 5)) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "suggest-row";
+    const score = document.createElement("span");
+    score.className = "suggest-score";
+    score.textContent = `${Math.round(Number(hit.score) * 100)}%`;
+    const body = document.createElement("span");
+    body.className = "suggest-body";
+    const source = document.createElement("span");
+    source.className = "suggest-source";
+    source.textContent = hit.source;
+    const target = document.createElement("span");
+    target.className = "suggest-target";
+    target.textContent = hit.target;
+    body.append(source, target);
+    row.append(score, body);
+    row.title = "点击插入，Shift+点击替换";
+    row.addEventListener("click", (event) => {
+      event.preventDefault();
+      applySuggestion(hit.target, event.shiftKey);
     });
-    if (collapsed) {
-      laneHead.style.gridColumn = "1 / -1";
-      laneHead.classList.add("is-collapsed");
-      laneHead.textContent = `▸ ${laneName(kind)} · ${laneCards.length} 张卡片`;
-      grid.append(laneHead);
-      continue;
-    }
-    grid.append(laneHead);
-    for (const column of columns) {
-      const cell = document.createElement("div");
-      cell.className = "board-cell";
-      cell.dataset.stage = column.key;
-      cell.dataset.kind = kind;
-      const cellCards = laneCards.filter((card) => card.stage === column.key);
-      for (const card of cellCards) cell.append(boardCard(card));
-      if (!cellCards.length) {
-        const empty = document.createElement("div");
-        empty.className = "board-column-empty";
-        empty.textContent = "—";
-        cell.append(empty);
-      }
-      cell.addEventListener("dragover", (event) => {
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-        cell.classList.add("is-drop");
-      });
-      cell.addEventListener("dragleave", (event) => {
-        if (!cell.contains(event.relatedTarget)) cell.classList.remove("is-drop");
-      });
-      cell.addEventListener("drop", (event) => {
-        event.preventDefault();
-        cell.classList.remove("is-drop");
-        let payload = null;
-        try {
-          payload = JSON.parse(event.dataTransfer.getData("text/plain"));
-        } catch {
-          payload = null;
-        }
-        if (!payload || !payload.id) return;
-        if ((payload.kind || "video") !== kind) {
-          toast("不能跨泳道（类型）移动卡片", true);
-          return;
-        }
-        moveCard(payload.id, column.key, kind)
-          .catch((error) => toast(error.message, true));
-      });
-      grid.append(cell);
-    }
+    root.append(row);
   }
-  root.append(grid);
+  for (const term of terms) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "term-chip"
+      + (term.forbidden ? " is-forbidden" : "")
+      + (term.status === "deprecated" ? " is-deprecated" : "");
+    chip.textContent = `${term.source} → ${term.target}`;
+    chip.title = term.forbidden ? "禁译词"
+      : `状态：${term.status || "preferred"}`;
+    chip.addEventListener("click", () => applySuggestion(term.target, false));
+    root.append(chip);
+  }
+  if (data.mt && data.mt.target) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "suggest-row is-mt";
+    const score = document.createElement("span");
+    score.className = "suggest-score";
+    score.textContent = "MT";
+    const body = document.createElement("span");
+    body.className = "suggest-body";
+    const target = document.createElement("span");
+    target.className = "suggest-target";
+    target.textContent = data.mt.target;
+    body.append(target);
+    row.append(score, body);
+    row.title = `模型 ${data.mt.model || "本地"}；点击插入`;
+    row.addEventListener("click", (event) => {
+      event.preventDefault();
+      applySuggestion(data.mt.target, event.shiftKey);
+    });
+    root.append(row);
+  }
+  if (!tm.length && !terms.length && !(data.mt && data.mt.target)) {
+    const empty = document.createElement("div");
+    empty.className = "suggest-empty";
+    empty.textContent = "没有匹配的记忆库或术语。";
+    root.append(empty);
+  }
 }
 
-async function moveCard(subprojectId, stage, kind) {
-  const card = ((state.board && state.board.cards) || [])
-    .find((item) => item.subproject_id === subprojectId);
-  if (!card) return;
-  if (kind && (card.kind || "video") !== kind) {
-    toast("不能跨泳道（类型）移动卡片", true);
+async function requestMtSuggestion() {
+  const cue = currentCue();
+  if (!cue || !state.project || !state.subId) {
+    toast("请先选择字幕行", true);
     return;
   }
-  if (card.stage === stage && card.stage_source === "auto") return;
-  const order = ((state.board && state.board.columns) || [])
-    .map((column) => column.key);
-  const from = order.indexOf(card.derived_stage);
-  const to = order.indexOf(stage);
-  let reason = "";
-  if (from >= 0 && to >= 0 && to < from) {
-    reason = window.prompt(
-      `把「${card.name}」移回「${stageLabel(stage)}」需要填写原因：`, "");
-    if (reason === null) return;
-    if (!reason.trim()) {
-      toast("需要填写原因", true);
-      return;
-    }
-  }
+  $("suggest-state").textContent = "请求 MT…";
   try {
-    await api.patchWorkflow(card.project_id, subprojectId, {
-      stage_override: stage === "archived" ? null : stage,
-      archived: stage === "archived",
-      reason,
-      revision: card.revision,
-    });
-    await loadBoard();
-    toast(`已移到「${stageLabel(stage)}」`);
+    const payload = await api.suggestMt(state.projectId, state.subId, cue.id);
+    state.suggest = state.suggest || { tm: [], terms: [] };
+    state.suggest.mt = payload;
+    renderSuggestions();
+    if (!payload.target) toast("MT 返回为空", true);
   } catch (error) {
     toast(error.message, true);
-    await loadBoard();
+    renderSuggestions();
   }
 }
 
-async function openSubproject(id) {
-  state.subId = id;
-  localStorage.setItem(`ncat.sub.${state.projectId}`, id);
-  await loadSub();
-  setProjectView("list");
-  switchTab("editor");
-}
+/* ------------------------------------------------------- 分段状态 */
 
-function setProjectView(view) {
-  state.projectView = view === "list" ? "list" : "board";
-  document.querySelectorAll("#project-view-switch .view-btn").forEach((button) => {
-    button.classList.toggle("is-active",
-      button.dataset.projectView === state.projectView);
-  });
-  const board = $("project-board");
-  const tabs = $("project-tabs");
-  const panels = [...document.querySelectorAll("[data-project-panel]")];
-  if (!board || !tabs) return;
-  if (state.projectView === "board") {
-    if (state.project) {
-      $("home-view").hidden = true;
-      $("project-shell").hidden = false;
-    }
-    board.hidden = false;
-    tabs.hidden = true;
-    panels.forEach((panel) => {
-      panel.hidden = true;
-      panel.classList.remove("is-active");
-    });
-    loadBoard().catch(() => {});
-    return;
-  }
-  board.hidden = true;
-  tabs.hidden = false;
-  const name = state.activeTab && state.activeTab !== "home"
-    ? state.activeTab : "assets";
-  showProject(name);
-}
 
 function bindHealth() {
   $("health-toggle").addEventListener("click", (event) => {
@@ -1763,59 +2322,565 @@ function bindHealth() {
   });
 }
 
-async function loadSettings() {
-  try {
-    state.settings = await api.settings();
-    const asr = state.settings.asr || {};
-    const mt = state.settings.mt || {};
-    $("settings-asr-mode").value = asr.mode || "local";
-    $("settings-mt-mode").value = mt.mode || "local";
-    $("settings-asr-key-state").textContent = asr.api_key_set
-      ? `ASR key configured (${asr.api_key_source})`
-      : "未配置 ASR Key（本地模式无需）";
-    $("settings-mt-key-state").textContent = mt.api_key_set
-      ? `MT key configured (${mt.api_key_source})`
-      : "未配置 MT Key（本地模式无需）";
-    $("settings-asr-api-key").value = "";
-    $("settings-mt-api-key").value = "";
-    $("settings-asr-clear-key").checked = false;
-    $("settings-mt-clear-key").checked = false;
-    $("settings-message").textContent = "";
-    $("settings-message").classList.remove("is-error");
-  } catch (error) {
-    $("settings-message").textContent = error.message;
-    $("settings-message").classList.add("is-error");
+function parseHeaderLines(text) {
+  const headers = {};
+  for (const raw of String(text || "").split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (key) headers[key] = value;
+  }
+  return headers;
+}
+
+function formatHeaderLines(headers) {
+  return Object.entries(headers || {})
+    .map(([key, value]) => `${key}: ${value}`).join("\n");
+}
+
+function sortedModels(models) {
+  return [...new Set((models || []).map((item) => String(item || "").trim())
+    .filter(Boolean))].sort(
+      (left, right) => left.localeCompare(
+        right, undefined, { sensitivity: "base" }));
+}
+
+function newProviderId() {
+  return `prov_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function defaultProvider(service) {
+  return {
+    id: newProviderId(),
+    service,
+    provider_id: "",
+    provider_name: "",
+    api_type: service === "asr" ? "openai_audio" : "openai_chat",
+    base_url: "",
+    api_key: "",
+    api_key_set: false,
+    api_key_source: "none",
+    headers: {},
+    default_model: "",
+    models: [],
+    model_names: {},
+    model_tags: {},
+  };
+}
+
+function providerById(id) {
+  if (state.currentProvider && state.currentProvider.id === id) {
+    return state.currentProvider;
+  }
+  return state.providers.find((provider) => provider.id === id);
+}
+
+function renderActiveSelects() {
+  for (const service of ["asr", "mt"]) {
+    const select = $(`settings-${service}-active`);
+    const current = state.activeProviders[service] || "";
+    select.replaceChildren();
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "未选择";
+    select.append(none);
+    for (const provider of state.providers.filter(
+      (item) => item.service === service)) {
+      const option = document.createElement("option");
+      option.value = provider.id;
+      option.textContent = provider.provider_name
+        || provider.provider_id || provider.id;
+      select.append(option);
+    }
+    select.value = state.providers.some(
+      (item) => item.id === current && item.service === service)
+      ? current : "";
   }
 }
 
+function renderDialogModelSelect(provider, selected = "") {
+  const select = $("provider-default-model");
+  const names = state.providerModelNames[provider.id]
+    || { ...(provider.model_names || {}) };
+  state.providerModelNames[provider.id] = names;
+  const current = String(selected || "");
+  const available = sortedModels(
+    state.providerModels[provider.id] || provider.models || []);
+  if (current && !available.includes(current)) {
+    available.push(current);
+    available.sort((left, right) => left.localeCompare(
+      right, undefined, { sensitivity: "base" }));
+  }
+  for (const model of available) {
+    if (!names[model]) names[model] = model;
+  }
+  select.replaceChildren();
+  for (const model of available) {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = names[model] || model;
+    select.append(option);
+  }
+  const custom = document.createElement("option");
+  custom.value = "__custom__";
+  custom.textContent = "＋ 添加自定义模型";
+  select.append(custom);
+  select.value = current && available.includes(current) ? current : "__custom__";
+  state.lastModelValue[provider.id] = select.value;
+}
+
+function setProviderMessage(text, error = false) {
+  const node = $("provider-message");
+  node.textContent = text;
+  node.classList.toggle("is-error", error);
+}
+
+function setProviderFetchMessage(text, error = false) {
+  const node = $("provider-fetch-message");
+  node.textContent = text;
+  node.classList.toggle("is-error", error);
+}
+
+function providerApiTypes(service) {
+  return service === "asr"
+    ? [["openai_audio", "OpenAI Audio（/v1/audio/transcriptions）"]]
+    : [["openai_chat", "OpenAI Chat Completions"],
+       ["openai_responses", "OpenAI Responses"],
+       ["anthropic", "Anthropic Messages"]];
+}
+
+function populateProviderDialog(provider) {
+  $("provider-dialog-title").textContent =
+    `${state.providerDialogEditing ? "编辑" : "添加"} `
+    + `${provider.service === "asr" ? "ASR" : "MT"} 提供商`;
+  $("provider-submit").textContent =
+    state.providerDialogEditing ? "保存" : "添加";
+  $("provider-id").value = provider.id;
+  $("provider-service").value = provider.service;
+  $("provider-provider-id").value = provider.provider_id || "";
+  $("provider-provider-name").value = provider.provider_name || "";
+  $("provider-base-url").value = provider.base_url || "";
+  $("provider-api-key").value = "";
+  $("provider-headers").value = formatHeaderLines(provider.headers);
+  $("provider-clear-message").textContent = "";
+  $("provider-key-state").textContent = provider.api_key_set
+    ? `Key configured (${provider.api_key_source || "settings"})`
+    : "未配置 Key";
+  $("provider-ignore-health").checked = Boolean(provider.ignore_health);
+  const apiType = $("provider-api-type");
+  apiType.replaceChildren();
+  const types = providerApiTypes(provider.service);
+  for (const [value, label] of types) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    apiType.append(option);
+  }
+  apiType.value = types.some(([value]) => value === provider.api_type)
+    ? provider.api_type : types[0][0];
+  renderDialogModelSelect(provider, provider.default_model);
+  setProviderMessage("");
+  setProviderFetchMessage("");
+}
+
+function openProviderDialog(service, provider = null) {
+  const draft = provider
+    ? {
+        ...provider,
+        headers: { ...(provider.headers || {}) },
+        models: [...(provider.models || [])],
+        model_names: { ...(provider.model_names || {}) },
+        model_tags: { ...(provider.model_tags || {}) },
+      }
+    : defaultProvider(service);
+  state.currentProvider = draft;
+  state.providerDialogEditing = Boolean(provider);
+  state.providerModels[draft.id] = [...(draft.models || [])];
+  state.providerModelNames[draft.id] = { ...(draft.model_names || {}) };
+  state.providerModelTags[draft.id] = { ...(draft.model_tags || {}) };
+  state.clearKeys[draft.id] = false;
+  state.lastModelValue[draft.id] = draft.default_model || "";
+  populateProviderDialog(draft);
+  $("provider-submit").disabled = false;
+  $("provider-dialog").showModal();
+  $("provider-provider-id").focus();
+}
+
+function closeProviderDialog(commit = false) {
+  const provider = state.currentProvider;
+  const id = provider ? provider.id : "";
+  $("provider-dialog").close();
+  if (!commit && id && !state.providers.some((item) => item.id === id)) {
+    delete state.providerModels[id];
+    delete state.providerModelNames[id];
+    delete state.providerModelTags[id];
+    delete state.clearKeys[id];
+    delete state.lastModelValue[id];
+  }
+  state.currentProvider = null;
+  state.providerDialogEditing = false;
+}
+
+function readProviderDialog() {
+  const provider = state.currentProvider;
+  const selected = $("provider-default-model").value;
+  return {
+    ...provider,
+    provider_id: $("provider-provider-id").value.trim(),
+    provider_name: $("provider-provider-name").value.trim(),
+    api_type: $("provider-api-type").value,
+    base_url: $("provider-base-url").value.trim(),
+    api_key: $("provider-api-key").value.trim(),
+    headers: parseHeaderLines($("provider-headers").value),
+    default_model: selected === "__custom__" ? "" : selected,
+    models: state.providerModels[provider.id] || provider.models || [],
+    model_names: state.providerModelNames[provider.id]
+      || provider.model_names || {},
+    model_tags: state.providerModelTags[provider.id]
+      || provider.model_tags || {},
+    clear_api_key: Boolean(state.clearKeys[provider.id]),
+    ignore_health: $("provider-ignore-health").checked,
+  };
+}
+
+async function fetchProviderModels(providerId) {
+  const provider = providerById(providerId);
+  if (!provider) throw new Error("提供商不存在");
+  const baseUrl = $("provider-base-url").value.trim();
+  if (!baseUrl) throw new Error("请先填写 Endpoint / Base URL");
+  const result = await api.providerModels({
+    service: provider.service,
+    id: provider.id,
+    base_url: baseUrl,
+    api_type: $("provider-api-type").value,
+    api_key: $("provider-api-key").value.trim(),
+    headers: parseHeaderLines($("provider-headers").value),
+  });
+  const selected = $("provider-default-model").value;
+  state.providerModels[provider.id] = sortedModels([
+    ...(state.providerModels[provider.id] || provider.models || []),
+    ...(result.models || []),
+  ]);
+  const names = state.providerModelNames[provider.id]
+    || { ...(provider.model_names || {}) };
+  for (const model of result.models || []) {
+    if (!names[model]) names[model] = model;
+  }
+  state.providerModelNames[provider.id] = names;
+  renderDialogModelSelect(provider,
+                          selected === "__custom__" ? "" : selected);
+  return state.providerModels[provider.id];
+}
+
+async function saveProviderDialog(event) {
+  event.preventDefault();
+  const submit = $("provider-submit");
+  if (submit.disabled) return;
+  const provider = readProviderDialog();
+  if (!provider.base_url) {
+    setProviderMessage("请填写 Endpoint / Base URL。", true);
+    return;
+  }
+  submit.disabled = true;
+  setProviderMessage("检查 API…");
+  let models;
+  try {
+    models = await fetchProviderModels(provider.id);
+  } catch (error) {
+    setProviderMessage(`API 不可用：${error.message}`, true);
+    submit.disabled = false;
+    return;
+  }
+  if (!provider.default_model) {
+    if (!models.length) {
+      setProviderMessage("未获取到模型，请手动添加或填写默认模型。", true);
+      submit.disabled = false;
+      return;
+    }
+    provider.default_model = models[0];
+    renderDialogModelSelect(provider, provider.default_model);
+  }
+  if (provider.service === "mt" && !provider.default_model) {
+    setProviderMessage("MT 提供商需要选择默认模型。", true);
+    submit.disabled = false;
+    return;
+  }
+  const providers = [...state.providers];
+  const index = providers.findIndex((item) => item.id === provider.id);
+  if (index >= 0) providers[index] = provider;
+  else providers.push(provider);
+  const active = { ...state.activeProviders };
+  if (!active[provider.service]) active[provider.service] = provider.id;
+  try {
+    await api.saveSettings({
+      providers,
+      asr: { active_provider_id: active.asr },
+      mt: { active_provider_id: active.mt },
+    });
+  } catch (error) {
+    setProviderMessage(error.message, true);
+    submit.disabled = false;
+    return;
+  }
+  setProviderMessage(state.providerDialogEditing ? "保存成功" : "添加成功");
+  setTimeout(async () => {
+    closeProviderDialog(true);
+    await loadSettings();
+  }, 700);
+}
+
+function renderProviderList() {
+  const list = $("settings-provider-list");
+  list.replaceChildren();
+  for (const provider of state.providers) {
+    const row = document.createElement("div");
+    row.className = "provider-row";
+    const main = document.createElement("div");
+    main.className = "provider-row-main";
+    const name = document.createElement("div");
+    name.className = "provider-row-name";
+    name.textContent = provider.provider_name || "—";
+    const id = document.createElement("div");
+    id.className = "provider-row-id";
+    id.textContent = provider.provider_id || "—";
+    main.append(name, id);
+    const meta = document.createElement("div");
+    meta.className = "provider-row-meta";
+    for (const text of [
+      `模型数量 ${(provider.models || []).length}`,
+      "丨",
+      `默认模型 ${provider.default_model || "—"}`,
+    ]) {
+      const item = document.createElement("span");
+      item.textContent = text;
+      meta.append(item);
+    }
+    const actions = document.createElement("div");
+    actions.className = "provider-row-actions";
+    const edit = document.createElement("button");
+    edit.className = "btn btn-quiet";
+    edit.type = "button";
+    edit.textContent = "修改";
+    edit.addEventListener("click", () => {
+      openProviderDialog(provider.service, provider);
+    });
+    const remove = document.createElement("button");
+    remove.className = "btn provider-delete";
+    remove.type = "button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => deleteProvider(provider));
+    actions.append(edit, remove);
+    row.append(main, meta, actions);
+    list.append(row);
+  }
+  $("settings-provider-empty").hidden = state.providers.length > 0;
+  renderActiveSelects();
+}
+
+async function deleteProvider(provider) {
+  if (!window.confirm(`删除提供商「${provider.provider_name || provider.provider_id || provider.id}」？`)) {
+    return;
+  }
+  const providers = state.providers.filter((item) => item.id !== provider.id);
+  const active = { ...state.activeProviders };
+  if (active[provider.service] === provider.id) {
+    const fallback = providers.find(
+      (item) => item.service === provider.service);
+    active[provider.service] = fallback ? fallback.id : "";
+  }
+  try {
+    await api.saveSettings({
+      providers,
+      asr: { active_provider_id: active.asr },
+      mt: { active_provider_id: active.mt },
+    });
+    await loadSettings();
+    toast("提供商已删除");
+  } catch (error) {
+    setSettingsMessage(error.message, true);
+  }
+}
+
+async function persistActive(service) {
+  try {
+    await api.saveSettings({
+      providers: state.providers,
+      asr: { active_provider_id: state.activeProviders.asr },
+      mt: { active_provider_id: state.activeProviders.mt },
+    });
+    await loadSettings();
+  } catch (error) {
+    await loadSettings();
+    setSettingsMessage(error.message, true);
+  }
+}
+
+function openCustomModel(providerId) {
+  const provider = providerById(providerId);
+  if (!provider) return;
+  state.customProviderId = providerId;
+  state.customService = provider.service;
+  state.customModelPrevious = state.lastModelValue[providerId] || "__custom__";
+  $("model-id").value = "";
+  $("model-name").value = "";
+  $("model-reasoning").checked = false;
+  $("model-image").checked = false;
+  $("model-extra").hidden = provider.service !== "mt";
+  $("model-message").textContent = "";
+  $("model-message").classList.remove("is-error");
+  $("model-dialog").showModal();
+  $("model-id").focus();
+}
+
+function closeCustomModel(commit = false) {
+  const providerId = state.customProviderId;
+  const previous = state.customModelPrevious;
+  $("model-dialog").close();
+  state.customProviderId = "";
+  state.customService = "";
+  if (!commit && providerId) {
+    const provider = providerById(providerId);
+    if (provider) {
+      renderDialogModelSelect(
+        provider, previous === "__custom__" ? "" : previous);
+    }
+  }
+}
+
+function setSettingsMessage(text, error = false) {
+  const node = $("settings-message");
+  node.textContent = text;
+  node.classList.toggle("is-error", error);
+}
+
 function bindSettings() {
-  $("settings-save").addEventListener("click", async () => {
-    const body = {
-      asr: {
-        mode: $("settings-asr-mode").value,
-        clear_api_key: $("settings-asr-clear-key").checked,
-      },
-      mt: {
-        mode: $("settings-mt-mode").value,
-        clear_api_key: $("settings-mt-clear-key").checked,
-      },
-    };
-    const asrKey = $("settings-asr-api-key").value.trim();
-    const mtKey = $("settings-mt-api-key").value.trim();
-    if (asrKey) body.asr.api_key = asrKey;
-    if (mtKey) body.mt.api_key = mtKey;
+  document.querySelectorAll("#settings-nav [data-settings-section]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        document.querySelectorAll("#settings-nav .settings-nav-item")
+          .forEach((item) => item.classList.toggle(
+            "is-active", item === button));
+        document.querySelectorAll("[data-settings-panel]")
+          .forEach((panel) => {
+            panel.hidden = panel.dataset.settingsPanel
+              !== button.dataset.settingsSection;
+          });
+      });
+    });
+  $("settings-add-asr").addEventListener(
+    "click", () => openProviderDialog("asr"));
+  $("settings-add-mt").addEventListener(
+    "click", () => openProviderDialog("mt"));
+  for (const service of ["asr", "mt"]) {
+    $(`settings-${service}-active`).addEventListener("change", (event) => {
+      state.activeProviders[service] = event.target.value;
+      persistActive(service);
+    });
+  }
+  $("provider-form").addEventListener("submit", saveProviderDialog);
+  $("provider-cancel").addEventListener(
+    "click", () => closeProviderDialog(false));
+  $("provider-fetch-models").addEventListener("click", async () => {
     try {
-      state.settings = await api.saveSettings(body);
-      $("settings-message").textContent = "设置已保存。";
-      $("settings-message").classList.remove("is-error");
-      await loadSettings();
-      await loadHealth();
-      toast("设置已保存");
+      const models = await fetchProviderModels(state.currentProvider.id);
+      setProviderFetchMessage(
+        `获取到 ${models.length} 个模型/后端，请选择`);
     } catch (error) {
-      $("settings-message").textContent = error.message;
-      $("settings-message").classList.add("is-error");
+      setProviderFetchMessage(
+        `自动获取失败：${error.message}；请手动填写模型`, true);
     }
   });
+  $("provider-api-key").addEventListener("input", () => {
+    if ($("provider-api-key").value) {
+      state.clearKeys[state.currentProvider.id] = false;
+      $("provider-clear-message").textContent = "";
+    }
+  });
+  $("provider-clear-key").addEventListener("click", () => {
+    state.clearKeys[state.currentProvider.id] = true;
+    $("provider-api-key").value = "";
+    $("provider-clear-message").textContent = "API Key已清除";
+  });
+  $("provider-default-model").addEventListener("change", () => {
+    const value = $("provider-default-model").value;
+    if (value === "__custom__") {
+      openCustomModel(state.currentProvider.id);
+    } else {
+      state.lastModelValue[state.currentProvider.id] = value;
+    }
+  });
+  $("model-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const provider = state.currentProvider;
+    const modelId = $("model-id").value.trim();
+    const name = $("model-name").value.trim();
+    if (!modelId || !name) {
+      $("model-message").textContent = "Model ID 和 Model Name 都需要填写。";
+      $("model-message").classList.add("is-error");
+      return;
+    }
+    if (!state.providerModelNames[provider.id]) {
+      state.providerModelNames[provider.id] = {};
+    }
+    state.providerModelNames[provider.id][modelId] = name;
+    if (provider.service === "mt") {
+      if (!state.providerModelTags[provider.id]) {
+        state.providerModelTags[provider.id] = {};
+      }
+      state.providerModelTags[provider.id][modelId] = {
+        reasoning: $("model-reasoning").checked,
+        image: $("model-image").checked,
+      };
+    }
+    state.providerModels[provider.id] = sortedModels([
+      ...(state.providerModels[provider.id] || []),
+      modelId,
+    ]);
+    renderDialogModelSelect(provider, modelId);
+    closeCustomModel(true);
+  });
+  $("model-cancel").addEventListener("click", () => closeCustomModel(false));
+}
+
+async function loadSettings() {
+  try {
+    state.settings = await api.settings();
+    state.providers = (state.settings.providers || []).map((provider) => ({
+      ...provider,
+      headers: { ...(provider.headers || {}) },
+      models: [...(provider.models || [])],
+      model_names: { ...(provider.model_names || {}) },
+      model_tags: { ...(provider.model_tags || {}) },
+    }));
+    state.activeProviders = {
+      asr: state.settings.asr?.active_provider_id || "",
+      mt: state.settings.mt?.active_provider_id || "",
+    };
+    state.providerModels = {};
+    state.providerModelNames = {};
+    state.providerModelTags = {};
+    state.lastModelValue = {};
+    state.clearKeys = {};
+    for (const provider of state.providers) {
+      state.providerModels[provider.id] = [...(provider.models || [])];
+      state.providerModelNames[provider.id] = {
+        ...(provider.model_names || {}),
+      };
+      state.providerModelTags[provider.id] = {
+        ...(provider.model_tags || {}),
+      };
+      state.clearKeys[provider.id] = false;
+    }
+    state.currentProvider = null;
+    state.providerDialogEditing = false;
+    renderProviderList();
+    setSettingsMessage("");
+  } catch (error) {
+    setSettingsMessage(error.message, true);
+  }
 }
 
 async function loadJobs() {
@@ -2080,96 +3145,151 @@ async function drawWaveform(url) {
   }
 }
 
+function syncHeaderHeight() {
+  const header = document.querySelector(".app-header");
+  if (!header) return;
+  document.documentElement.style.setProperty(
+    "--header-h", `${header.offsetHeight}px`);
+}
+
+function setSidebar(open) {
+  state.sidebarOpen = Boolean(open);
+  $("app-sidebar").classList.toggle("is-open", state.sidebarOpen);
+  $("app-sidebar").setAttribute("aria-hidden", String(!state.sidebarOpen));
+  $("sidebar-toggle").setAttribute("aria-expanded", String(state.sidebarOpen));
+  $("sidebar-backdrop").hidden = !state.sidebarOpen || state.sidebarPinned;
+  document.body.classList.toggle(
+    "sidebar-reserved", state.sidebarOpen && state.sidebarPinned);
+  if (!state.sidebarOpen) $("health-popover").hidden = true;
+  try {
+    localStorage.setItem("ncat.sidebar", state.sidebarOpen ? "open" : "closed");
+  } catch (error) {
+    /* storage can be unavailable in private modes */
+  }
+}
+
+function setSidebarPinned(pinned) {
+  state.sidebarPinned = Boolean(pinned);
+  $("sidebar-pinned").setAttribute(
+    "aria-pressed", String(state.sidebarPinned));
+  try {
+    localStorage.setItem("ncat.sidebar.pinned",
+                        state.sidebarPinned ? "1" : "0");
+  } catch (error) {
+    /* storage can be unavailable in private modes */
+  }
+  setSidebar(state.sidebarPinned ? true : state.sidebarOpen);
+}
+
+function initSidebar() {
+  syncHeaderHeight();
+  let stored = null;
+  let pinned = false;
+  try {
+    stored = localStorage.getItem("ncat.sidebar");
+    pinned = localStorage.getItem("ncat.sidebar.pinned") === "1";
+  } catch (error) {
+    /* storage can be unavailable in private modes */
+  }
+  state.sidebarPinned = pinned;
+  $("sidebar-pinned").setAttribute("aria-pressed", String(pinned));
+  $("sidebar-pinned").addEventListener("click", () => {
+    setSidebarPinned(!state.sidebarPinned);
+  });
+  setSidebar(stored ? stored === "open" : false);
+  if (pinned) setSidebar(true);
+  $("sidebar-toggle").addEventListener("click", () => {
+    setSidebar(!state.sidebarOpen);
+  });
+  $("sidebar-backdrop").addEventListener("click", () => setSidebar(false));
+  window.addEventListener("resize", syncHeaderHeight);
+  if (window.ResizeObserver) {
+    new ResizeObserver(syncHeaderHeight).observe(
+      document.querySelector(".app-header"));
+  }
+}
+
 function bindTabs() {
-  document.querySelectorAll("#tabs .tab").forEach((button) => {
-    button.addEventListener("click", () => switchTab(button.dataset.tab));
+  document.querySelectorAll("[data-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      switchTab(button.dataset.tab);
+      if (!state.sidebarPinned) setSidebar(false);
+    });
   });
   document.querySelectorAll("#project-tabs [data-project-tab]").forEach((button) => {
-    button.addEventListener("click", () => switchTab(button.dataset.projectTab));
+    button.addEventListener(
+      "click", () => switchTab(button.dataset.projectTab, true));
   });
 }
 
 function showHome() {
   state.activeTab = "home";
+  state.screen = "home";
+  const subtitle = $("header-subtitle");
+  if (subtitle) {
+    subtitle.textContent = "Nick's Computer-Aided Translating Solution";
+  }
+  syncRoute();
   $("home-view").hidden = false;
   $("project-shell").hidden = true;
   document.querySelectorAll(".tab-panel").forEach((panel) => {
     panel.classList.remove("is-active");
   });
-  document.querySelectorAll("#tabs .tab").forEach((button) => {
-    button.classList.remove("is-active");
+  document.querySelectorAll("[data-tab]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.tab === "home");
   });
 }
 
 function showGlobal(name) {
   state.activeTab = name;
+  state.screen = "global";
+  syncRoute();
   $("home-view").hidden = true;
   $("project-shell").hidden = true;
   document.querySelectorAll(".tab-panel").forEach((panel) => {
     panel.classList.toggle("is-active", panel.dataset.panel === name);
   });
-  document.querySelectorAll("#tabs .tab").forEach((button) => {
+  document.querySelectorAll("[data-tab]").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.tab === name);
   });
 }
 
 function showProject(name) {
-  state.activeTab = name;
-  $("home-view").hidden = true;
-  $("project-shell").hidden = false;
-  if (state.projectView === "board") {
-    $("project-board").hidden = false;
-    $("project-tabs").hidden = true;
-    document.querySelectorAll("[data-project-panel]").forEach((panel) => {
-      panel.hidden = true;
-      panel.classList.remove("is-active");
-    });
-    renderBoard();
+  if (name === "overview") {
+    setProjectView("overview");
     return;
   }
-  document.querySelectorAll(".tab-panel").forEach((panel) => {
-    panel.classList.remove("is-active");
-  });
-  document.querySelectorAll("#tabs .tab").forEach((button) => {
-    button.classList.remove("is-active");
-  });
-  document.querySelectorAll("[data-project-panel]").forEach((panel) => {
-    panel.classList.toggle("is-active", panel.dataset.projectPanel === name);
-    panel.hidden = panel.dataset.projectPanel !== name;
-  });
-  document.querySelectorAll("#project-tabs [data-project-tab]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.projectTab === name);
-  });
-  if (name === "transcript") renderTranscriptTab();
-  if (name === "styles") {
-    loadStyles().catch((error) => toast(error.message, true));
-    loadAudit().catch(() => {});
+  if (name === "board") {
+    setProjectView("board");
+    return;
   }
-  if (name === "qa") loadQa().catch((error) => toast(error.message, true));
-  requestAnimationFrame(() => {
-    renderCues();
-    renderEditor();
-  });
+  if (name === "list") {
+    setProjectView("list");
+    return;
+  }
+  showSubprojectTab(name);
 }
 
-function switchTab(name) {
-  const projectTabs = ["assets", "editor", "transcript", "styles", "qa"];
-  if (projectTabs.includes(name)) {
+function switchTab(name, projectMode = false) {
+  const aliases = { assets: "import", editor: "subtitle" };
+  const tab = aliases[name] || name;
+  if (projectMode && PROJECT_TABS.includes(tab)) {
     if (!state.project) {
       toast("请先选择项目", true);
       showHome();
       return;
     }
-    if (state.projectView === "board") {
-      state.projectView = "list";
-      document.querySelectorAll("#project-view-switch .view-btn").forEach((button) => {
-        button.classList.toggle("is-active",
-          button.dataset.projectView === "list");
-      });
-      $("project-board").hidden = true;
-      $("project-tabs").hidden = false;
+    if (!state.subId) {
+      const first = (state.project.subprojects || [])[0];
+      if (!first) {
+        toast("请先新建子项目", true);
+        return;
+      }
+      state.subId = first.id;
+      state.subOpen = true;
+      loadSub().catch((error) => toast(error.message, true));
     }
-    showProject(name);
+    showSubprojectTab(tab);
     return;
   }
   if (name === "home" || name === "projects") {
@@ -2190,24 +3310,467 @@ function switchTab(name) {
 }
 
 function bindContext() {
-  $("project-select").addEventListener("change", (event) => {
-    selectProject(event.target.value).then(() => {
-      state.effectiveTerms = [];
-      state.effectiveTm = [];
+  document.querySelectorAll("#project-view-switch [data-project-view]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        setProjectView(button.dataset.projectView);
+      });
     });
+  $("project-search").addEventListener("input", () => {
+    if (state.projectView === "board") renderBoard();
+    else if (state.projectView === "list") renderSubprojectList();
   });
-  $("subproject-select").addEventListener("change", async (event) => {
-    state.subId = event.target.value;
-    state.effectiveTerms = [];
-    state.effectiveTm = [];
-    await loadSub();
-    if (state.activeTab === "terms") await loadTerms();
-    if (state.activeTab === "tm") await loadTm();
+  $("filter-button").addEventListener("click", (event) => {
+    event.stopPropagation();
+    const popover = $("filter-popover");
+    popover.hidden = !popover.hidden;
   });
-  $("refresh-context").addEventListener("click", async () => {
-    if (state.projectId) await selectProject(state.projectId);
-    else await loadWorkspace();
+  document.querySelectorAll("#filter-popover [data-filter-template]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        const input = $("project-search");
+        const template = button.dataset.filterTemplate
+          .replace(/&gt;/g, ">").replace(/&lt;/g, "<");
+        input.value = `${input.value} ${template}`.trim();
+        input.focus();
+        $("filter-popover").hidden = true;
+        if (state.projectView === "board") renderBoard();
+        else if (state.projectView === "list") renderSubprojectList();
+      });
+    });
+  $("list-mode-toggle").addEventListener("click", () => {
+    state.listMode = state.listMode === "flat" ? "tree" : "flat";
+    $("list-mode-toggle").textContent =
+      state.listMode === "flat" ? "层级" : "平铺";
+    renderSubprojectList();
   });
+  $("new-subproject").addEventListener("click", async () => {
+    if (!state.project) return;
+    if (!(state.project.categories || []).length) {
+      toast("请先在项目设置 → 编辑看板中创建分类和泳道", true);
+      return;
+    }
+    try {
+      const sub = await api.createSubproject(state.projectId, {});
+      await selectProject(state.projectId);
+      await openSubproject(sub.id);
+      setTimeout(() => {
+        const name = $("detail-name");
+        if (name) { name.focus(); name.select(); }
+      }, 50);
+      toast("已新建子项目");
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
+  $("project-settings").addEventListener("click", (event) => {
+    event.stopPropagation();
+    const menu = $("project-settings-menu");
+    menu.hidden = !menu.hidden;
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("#project-settings")
+        && !event.target.closest("#project-settings-menu")) {
+      $("project-settings-menu").hidden = true;
+    }
+    if (!event.target.closest("#filter-button")
+        && !event.target.closest("#filter-popover")) {
+      $("filter-popover").hidden = true;
+    }
+  });
+  $("edit-project-info").addEventListener("click", openProjectInfo);
+  $("edit-board").addEventListener("click", openBoardSettings);
+  $("edit-project-settings").addEventListener("click", openProjectSettings);
+  bindProjectSettings();
+  bindSubprojectDetail();
+}
+
+function openProjectInfo() {
+  $("project-settings-menu").hidden = true;
+  $("edit-project-name").value = state.project.project.name;
+  $("project-info-message").textContent = "";
+  $("project-info-dialog").showModal();
+}
+
+function bindProjectSettings() {
+  $("project-info-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await api.patchProject(state.projectId, {
+        name: $("edit-project-name").value.trim(),
+      });
+      $("project-info-dialog").close();
+      await selectProject(state.projectId);
+      toast("项目信息已保存");
+    } catch (error) {
+      $("project-info-message").textContent = error.message;
+    }
+  });
+  $("cancel-project-info").addEventListener(
+    "click", () => $("project-info-dialog").close());
+  $("add-category").addEventListener("click", async () => {
+    const name = $("new-category-name").value.trim();
+    if (!name) return;
+    try {
+      await api.addCategory(state.projectId, { name });
+      $("new-category-name").value = "";
+      await refreshProjectDialogData();
+      renderBoardSettings();
+    } catch (error) { $("board-settings-message").textContent = error.message; }
+  });
+  $("close-board-settings").addEventListener(
+    "click", () => $("board-settings-dialog").close());
+  $("close-project-settings").addEventListener(
+    "click", () => $("project-settings-dialog").close());
+  $("add-rule").addEventListener("click", async () => {
+    try {
+      await api.addAutomation(state.projectId, {
+        subtask_title: $("rule-subtask-title").value.trim(),
+        target_category_id: $("rule-target-category").value,
+        target_lane_id: $("rule-target-lane").value,
+      });
+      $("rule-subtask-title").value = "";
+      await refreshProjectDialogData();
+      renderProjectSettings();
+      toast("自动化规则已添加");
+    } catch (error) { $("project-settings-message").textContent = error.message; }
+  });
+}
+
+async function refreshProjectDialogData() {
+  const project = await api.project(state.projectId);
+  state.project = project;
+}
+
+function openBoardSettings() {
+  $("project-settings-menu").hidden = true;
+  $("board-settings-message").textContent = "";
+  renderBoardSettings();
+  $("board-settings-dialog").showModal();
+}
+
+function renderBoardSettings() {
+  const root = $("board-settings-list");
+  root.replaceChildren();
+  for (const category of state.project.categories || []) {
+    const section = document.createElement("section");
+    section.className = "board-settings-category";
+    const head = document.createElement("div");
+    head.className = "board-settings-head";
+    const name = document.createElement("strong");
+    name.textContent = category.name;
+    const rename = document.createElement("button");
+    rename.className = "btn btn-quiet";
+    rename.textContent = "改名";
+    rename.addEventListener("click", async () => {
+      const value = window.prompt("分类名称", category.name);
+      if (value === null || !value.trim()) return;
+      await api.patchCategory(state.projectId, category.id, { name: value });
+      await refreshProjectDialogData();
+      renderBoardSettings();
+    });
+    const remove = document.createElement("button");
+    remove.className = "btn provider-delete";
+    remove.textContent = "删除";
+    remove.addEventListener("click", async () => {
+      if (!window.confirm(`删除分类「${category.name}」？`)) return;
+      try {
+        await api.deleteCategory(state.projectId, category.id);
+        await refreshProjectDialogData();
+        renderBoardSettings();
+      } catch (error) { $("board-settings-message").textContent = error.message; }
+    });
+    const up = document.createElement("button");
+    up.className = "btn btn-quiet";
+    up.textContent = "↑";
+    up.disabled = state.project.categories.indexOf(category) === 0;
+    up.addEventListener("click", () => reorderCategory(category.id, -1));
+    const down = document.createElement("button");
+    down.className = "btn btn-quiet";
+    down.textContent = "↓";
+    down.disabled = state.project.categories.indexOf(category)
+      === state.project.categories.length - 1;
+    down.addEventListener("click", () => reorderCategory(category.id, 1));
+    head.append(name, up, down, rename, remove);
+    section.append(head);
+    for (const lane of category.lanes || []) {
+      const row = document.createElement("div");
+      row.className = "board-settings-lane";
+      const label = document.createElement("span");
+      label.textContent = lane.name;
+      const renameLane = document.createElement("button");
+      renameLane.className = "btn btn-quiet";
+      renameLane.textContent = "改名";
+      renameLane.addEventListener("click", async () => {
+        const value = window.prompt("泳道名称", lane.name);
+        if (value === null || !value.trim()) return;
+        await api.patchLane(state.projectId, category.id, lane.id,
+                            { name: value });
+        await refreshProjectDialogData();
+        renderBoardSettings();
+      });
+      const removeLane = document.createElement("button");
+      removeLane.className = "btn provider-delete";
+      removeLane.textContent = "删除";
+      removeLane.addEventListener("click", async () => {
+        if (!window.confirm(`删除泳道「${lane.name}」？`)) return;
+        try {
+          await api.deleteLane(state.projectId, category.id, lane.id);
+          await refreshProjectDialogData();
+          renderBoardSettings();
+        } catch (error) {
+          $("board-settings-message").textContent = error.message;
+        }
+      });
+      const laneUp = document.createElement("button");
+      laneUp.className = "btn btn-quiet";
+      laneUp.textContent = "↑";
+      laneUp.disabled = category.lanes.indexOf(lane) === 0;
+      laneUp.addEventListener("click", () => reorderLane(category.id, lane.id, -1));
+      const laneDown = document.createElement("button");
+      laneDown.className = "btn btn-quiet";
+      laneDown.textContent = "↓";
+      laneDown.disabled = category.lanes.indexOf(lane)
+        === category.lanes.length - 1;
+      laneDown.addEventListener("click", () => reorderLane(category.id, lane.id, 1));
+      row.append(label, laneUp, laneDown, renameLane, removeLane);
+      section.append(row);
+    }
+    const add = document.createElement("button");
+    add.className = "btn btn-quiet";
+    add.textContent = "添加泳道";
+    add.addEventListener("click", async () => {
+      const value = window.prompt("新泳道名称");
+      if (value === null || !value.trim()) return;
+      await api.addLane(state.projectId, category.id, { name: value });
+      await refreshProjectDialogData();
+      renderBoardSettings();
+    });
+    section.append(add);
+    root.append(section);
+  }
+  if (!(state.project.categories || []).length) {
+    root.textContent = "还没有分类。先添加一个分类，再添加泳道。";
+  }
+}
+
+function openProjectSettings() {
+  $("project-settings-menu").hidden = true;
+  $("project-settings-message").textContent = "";
+  renderProjectSettings();
+  $("project-settings-dialog").showModal();
+}
+
+function renderProjectSettings() {
+  const features = state.project.features || {};
+  const grid = $("feature-grid");
+  grid.replaceChildren();
+  const labels = {
+    ffmpeg: "媒体处理 (ffmpeg)", asr: "ASR", segment: "分句",
+    timing: "时轴", mt: "机器翻译", subtitle_edit: "字幕编辑",
+    export: "导出渲染",
+  };
+  for (const [key, label] of Object.entries(labels)) {
+    const wrap = document.createElement("label");
+    wrap.className = "field checkbox";
+    const span = document.createElement("span");
+    span.textContent = label;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(features[key]);
+    input.addEventListener("change", async () => {
+      try {
+        const result = await api.features(state.projectId,
+                                          { [key]: input.checked });
+        state.project.features = result.features;
+        syncProjectTabs();
+      } catch (error) { $("project-settings-message").textContent = error.message; }
+    });
+    wrap.append(span, input);
+    grid.append(wrap);
+  }
+  const categorySelect = $("rule-target-category");
+  categorySelect.replaceChildren();
+  for (const category of state.project.categories || []) {
+    const option = document.createElement("option");
+    option.value = category.id;
+    option.textContent = category.name;
+    categorySelect.append(option);
+  }
+  const syncLanes = () => {
+    const category = (state.project.categories || [])
+      .find((item) => item.id === categorySelect.value);
+    const laneSelect = $("rule-target-lane");
+    laneSelect.replaceChildren();
+    for (const lane of (category && category.lanes) || []) {
+      const option = document.createElement("option");
+      option.value = lane.id;
+      option.textContent = lane.name;
+      laneSelect.append(option);
+    }
+  };
+  categorySelect.onchange = syncLanes;
+  syncLanes();
+  const titles = new Set();
+  for (const sub of state.project.subprojects || []) {
+    for (const task of sub.subtasks || []) titles.add(task.title);
+  }
+  const options = $("subtask-title-options");
+  options.replaceChildren();
+  for (const title of titles) {
+    const option = document.createElement("option");
+    option.value = title;
+    options.append(option);
+  }
+  const list = $("automation-list");
+  list.replaceChildren();
+  for (const rule of state.project.automation || []) {
+    const row = document.createElement("div");
+    row.className = "link-row";
+    const text = document.createElement("span");
+    text.textContent = `完成「${rule.subtask_title}」→ 移动到目标泳道`;
+    const toggle = document.createElement("button");
+    toggle.className = "btn btn-quiet";
+    toggle.textContent = rule.enabled ? "停用" : "启用";
+    toggle.addEventListener("click", async () => {
+      await api.patchAutomation(state.projectId, rule.id,
+                                { enabled: !rule.enabled });
+      await refreshProjectDialogData();
+      renderProjectSettings();
+    });
+    const remove = document.createElement("button");
+    remove.className = "btn provider-delete";
+    remove.textContent = "删除";
+    remove.addEventListener("click", async () => {
+      await api.deleteAutomation(state.projectId, rule.id);
+      await refreshProjectDialogData();
+      renderProjectSettings();
+    });
+    row.append(text, toggle, remove);
+    list.append(row);
+  }
+  if (!(state.project.automation || []).length) {
+    list.textContent = "暂无自动化规则。";
+  }
+}
+
+function bindSubprojectDetail() {
+  $("detail-category").addEventListener("change", () => {
+    renderDetailLanes($("detail-category").value, "");
+  });
+  $("save-subproject-info").addEventListener("click", async () => {
+    try {
+      await api.patchSubproject(state.projectId, state.subId, {
+        name: $("detail-name").value.trim(),
+        description: $("detail-description").value,
+        category_id: $("detail-category").value,
+        lane_id: $("detail-lane").value,
+        due: $("detail-due").value || null,
+        done: $("detail-done").checked,
+      });
+      await selectProject(state.projectId, {
+        subId: state.subId, tab: state.activeTab,
+      });
+      toast("子项目信息已保存");
+    } catch (error) {
+      $("detail-message").textContent = error.message;
+    }
+  });
+  $("delete-subproject").addEventListener("click", async () => {
+    if (!state.subId || !window.confirm("删除当前子项目及其全部文件？")) return;
+    const projectId = state.projectId;
+    try {
+      await api.deleteSubproject(projectId, state.subId);
+      await selectProject(projectId);
+      toast("子项目已删除");
+    } catch (error) { toast(error.message, true); }
+  });
+  $("add-subtask").addEventListener("click", async () => {
+    const title = $("new-subtask-title").value.trim();
+    if (!title) return;
+    try {
+      await api.addSubtask(state.projectId, state.subId, title);
+      $("new-subtask-title").value = "";
+      await refreshSub();
+      toast("子任务已添加");
+    } catch (error) { toast(error.message, true); }
+  });
+  $("add-internal-link").addEventListener("click", async () => {
+    try {
+      await api.addInternalLink(state.projectId, state.subId, {
+        target_subproject_id: $("new-internal-target").value,
+        label: $("new-internal-label").value.trim(),
+      });
+      $("new-internal-label").value = "";
+      await refreshSub();
+    } catch (error) { toast(error.message, true); }
+  });
+  $("add-external-link").addEventListener("click", async () => {
+    try {
+      await api.addExternalLink(state.projectId, state.subId, {
+        label: $("new-external-label").value.trim(),
+        url: $("new-external-url").value.trim(),
+      });
+      $("new-external-label").value = "";
+      $("new-external-url").value = "";
+      await refreshSub();
+    } catch (error) { toast(error.message, true); }
+  });
+  $("add-comment").addEventListener("click", async () => {
+    const body = $("new-comment").value.trim();
+    if (!body) return;
+    try {
+      await api.addComment(state.projectId, state.subId, body);
+      $("new-comment").value = "";
+      await refreshSub();
+    } catch (error) { toast(error.message, true); }
+  });
+  $("add-attachment").addEventListener("click", async () => {
+    const file = $("attachment-file").files[0];
+    if (!file) return;
+    try {
+      await api.uploadAttachment(state.projectId, state.subId, file);
+      $("attachment-file").value = "";
+      await refreshSub();
+      toast("附件已上传");
+    } catch (error) { toast(error.message, true); }
+  });
+  $("open-qa").addEventListener("click", () => showSubprojectTab("qa"));
+  $("open-styles").addEventListener("click", () => showSubprojectTab("styles"));
+  $("back-to-subtitle").addEventListener(
+    "click", () => showSubprojectTab("subtitle"));
+  $("open-transcript").addEventListener(
+    "click", () => showSubprojectTab("transcript"));
+  $("back-to-export").addEventListener(
+    "click", () => showSubprojectTab("export"));
+}
+
+async function reorderCategory(categoryId, delta) {
+  const list = [...state.project.categories];
+  const index = list.findIndex((item) => item.id === categoryId);
+  const target = index + delta;
+  if (index < 0 || target < 0 || target >= list.length) return;
+  [list[index], list[target]] = [list[target], list[index]];
+  for (let i = 0; i < list.length; i += 1) {
+    await api.patchCategory(state.projectId, list[i].id, { order: i });
+  }
+  await refreshProjectDialogData();
+  renderBoardSettings();
+}
+
+async function reorderLane(categoryId, laneId, delta) {
+  const category = state.project.categories.find((item) => item.id === categoryId);
+  if (!category) return;
+  const list = [...category.lanes];
+  const index = list.findIndex((item) => item.id === laneId);
+  const target = index + delta;
+  if (index < 0 || target < 0 || target >= list.length) return;
+  [list[index], list[target]] = [list[target], list[index]];
+  for (let i = 0; i < list.length; i += 1) {
+    await api.patchLane(state.projectId, categoryId, list[i].id, { order: i });
+  }
+  await refreshProjectDialogData();
+  renderBoardSettings();
 }
 
 function bindProjectForm() {
@@ -2221,15 +3784,11 @@ function bindProjectForm() {
     }
     try {
       const created = await api.createProject({
-        name,
-        client: $("new-client").value.trim(),
-        source_lang: $("new-source-lang").value.trim() || "en",
-        target_langs: [$("new-target-lang").value.trim() || "zh-Hans"],
-        source: $("new-source").value.trim() || null,
-        subproject_name: $("new-subproject-name").value.trim() || "Main",
+        name, layout: $("new-layout").value,
       });
       $("project-message").textContent = "项目已创建。";
       $("project-message").classList.remove("is-error");
+      $("new-name").value = "";
       $("project-dialog").close();
       await loadWorkspace();
       await selectProject(created.project.id);
@@ -2239,43 +3798,25 @@ function bindProjectForm() {
     }
   });
   $("cancel-project").addEventListener("click", () => {
+    $("new-name").value = "";
     $("project-dialog").close();
     $("project-message").textContent = "";
     $("project-message").classList.remove("is-error");
-  });
-  $("open-subproject").addEventListener("click", () => {
-    if (!state.project) { toast("请先选择项目", true); return; }
-    $("subproject-dialog").showModal();
-  });
-  $("cancel-subproject").addEventListener("click", () => {
-    $("subproject-dialog").close();
-  });
-  $("add-subproject").addEventListener("click", async () => {
-    if (!state.project) { toast("请先选择项目", true); return; }
-    try {
-      const sub = await api.createSubproject(state.projectId, {
-        name: $("sub-name").value.trim() || "子项目",
-        kind: $("sub-kind").value,
-        source_path: $("sub-source").value.trim() || null,
-      });
-      $("sub-name").value = "";
-      $("sub-source").value = "";
-      $("subproject-dialog").close();
-      await selectProject(state.projectId);
-      state.subId = sub.id;
-      await loadSub();
-      switchTab("assets");
-      toast("子项目已添加");
-    } catch (error) { toast(error.message, true); }
   });
 }
 
 function bindHome() {
   $("new-project").addEventListener("click", () => {
+    $("new-name").value = "";
+    $("project-message").textContent = "";
+    $("project-message").classList.remove("is-error");
     $("project-dialog").showModal();
+    $("new-name").focus();
   });
-  $("home-brand").addEventListener("click", showHome);
-  $("home-button").addEventListener("click", showHome);
+  $("home-brand").addEventListener("click", () => {
+    showHome();
+    if (!state.sidebarPinned) setSidebar(false);
+  });
 }
 
 function bindAssets() {

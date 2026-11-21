@@ -10,26 +10,45 @@
 <body>
 
 <header class="app-header">
+  <button class="sidebar-toggle" id="sidebar-toggle" type="button"
+    aria-controls="app-sidebar" aria-expanded="false" aria-label="切换侧栏">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 6h16M4 12h16M4 18h16"></path>
+    </svg>
+  </button>
   <button class="brand-button" id="home-brand" type="button">
     <span class="brand">NCAT</span>
-    <span class="brand-sub">Nick's Computer-Aided Translating Solution</span>
+    <span class="brand-sub" id="header-subtitle">Nick's Computer-Aided Translating Solution</span>
   </button>
-  <nav class="tabs" id="tabs">
-    <button class="tab" data-tab="transcribe">转写</button>
-    <button class="tab" data-tab="terms">术语</button>
-    <button class="tab" data-tab="tm">记忆库</button>
-    <button class="tab" data-tab="settings">设置</button>
-  </nav>
   <span id="status" class="sr-only">空闲</span>
-  <button class="health-button" id="health-toggle" type="button">
-    <span class="health-dot" id="health-dot"></span> 运行状态
-  </button>
+</header>
+
+<aside class="app-sidebar" id="app-sidebar" aria-hidden="true">
+  <div class="sidebar-inner">
+    <nav class="tabs sidebar-tabs" id="tabs">
+      <button class="tab" data-tab="home">主页</button>
+      <button class="tab" data-tab="transcribe">转写</button>
+      <button class="tab" data-tab="terms">术语</button>
+      <button class="tab" data-tab="tm">记忆库</button>
+    </nav>
+    <div class="sidebar-foot">
+      <button class="health-button sidebar-pin" id="sidebar-pinned"
+        type="button" aria-pressed="false">
+        <span class="pin-dot" aria-hidden="true"></span> 固定侧栏
+      </button>
+      <button class="health-button" id="health-toggle" type="button">
+        <span class="health-dot" id="health-dot"></span> 运行状态
+      </button>
+      <button class="tab sidebar-settings" data-tab="settings">设置</button>
+    </div>
+  </div>
   <div class="health-popover" id="health-popover" hidden>
     <div class="panel-head"><span>服务运行状态</span>
       <span class="health-updated" id="health-updated">—</span></div>
     <div class="health-services" id="health-services"></div>
   </div>
-</header>
+</aside>
+<div class="sidebar-backdrop" id="sidebar-backdrop" hidden></div>
 
 <main class="tab-main">
 
@@ -57,38 +76,143 @@
       </div>
       <div class="project-shell-controls">
         <div class="view-switch" id="project-view-switch">
-          <button class="view-btn is-active" data-project-view="board" type="button">看板</button>
+          <button class="view-btn is-active" data-project-view="overview" type="button">概览</button>
+          <button class="view-btn" data-project-view="board" type="button">看板</button>
           <button class="view-btn" data-project-view="list" type="button">列表</button>
         </div>
-        <label>项目
-          <select id="project-select"><option value="">—</option></select>
-        </label>
-        <label>子项目
-          <select id="subproject-select"><option value="">—</option></select>
-        </label>
-        <button class="btn btn-quiet" type="button" id="refresh-context">刷新</button>
-        <button class="btn btn-quiet" type="button" id="open-subproject">+ 子项目</button>
-        <button class="btn btn-quiet" type="button" id="home-button">返回首页</button>
+        <div class="project-search">
+          <input id="project-search" type="search"
+            placeholder="搜索子项目；可输入 created>=2026-01-01 等筛选器">
+          <button class="btn btn-quiet" type="button" id="filter-button">筛选</button>
+          <div class="filter-popover" id="filter-popover" hidden>
+            <button type="button" data-filter-template='created&gt;='>创建时间</button>
+            <button type="button" data-filter-template='completed&gt;='>完成时间</button>
+            <button type="button" data-filter-template='due&gt;='>到期时间</button>
+            <button type="button" data-filter-template='due_within:7d'>N 天内到期</button>
+            <button type="button" data-filter-template='status:'>任务状态</button>
+            <button type="button" data-filter-template='category:"'>任务类别</button>
+          </div>
+        </div>
+        <button class="btn" type="button" id="new-subproject">新建子项目</button>
+        <div class="project-settings-wrap">
+          <button class="btn btn-quiet" type="button" id="project-settings">项目设置</button>
+          <div class="filter-popover" id="project-settings-menu" hidden>
+            <button type="button" id="edit-project-info">编辑信息</button>
+            <button type="button" id="edit-board">编辑看板</button>
+            <button type="button" id="edit-project-settings">项目设置</button>
+          </div>
+        </div>
       </div>
     </div>
     <div class="context-note" id="context-note"></div>
-    <nav class="project-tabs" id="project-tabs">
-      <button class="tab is-active" data-project-tab="assets">素材</button>
-      <button class="tab" data-project-tab="editor">编辑器</button>
-      <button class="tab" data-project-tab="transcript">转写稿</button>
-      <button class="tab" data-project-tab="styles">样式</button>
-      <button class="tab" data-project-tab="qa">质检</button>
+    <nav class="project-tabs" id="project-tabs" hidden>
+      <button class="tab is-active" data-project-tab="overview">概览</button>
+      <button class="tab" data-project-tab="import">导入</button>
+      <button class="tab" data-project-tab="transcribe">转录</button>
+      <button class="tab" data-project-tab="mt">机器翻译</button>
+      <button class="tab" data-project-tab="text">文本编辑</button>
+      <button class="tab" data-project-tab="subtitle">字幕编辑</button>
+      <button class="tab" data-project-tab="export">导出</button>
     </nav>
 
+    <section class="project-overview" id="project-overview">
+      <div class="overview-card" id="overview-summary"></div>
+      <div class="overview-grid" id="overview-categories"></div>
+      <section class="panel">
+        <div class="panel-head"><span>动态</span></div>
+        <div class="activity-list" id="activity-list"></div>
+      </section>
+    </section>
+
     <section class="project-board" id="project-board" hidden>
-      <div class="board-toolbar">
-        <input id="board-filter" type="search" placeholder="筛选卡片（名称 / 标签）">
-        <label class="board-toggle"><input id="board-show-archived" type="checkbox" checked> 显示已归档</label>
-      </div>
       <div class="board" id="board"></div>
     </section>
 
-    <section class="project-panel is-active" data-project-panel="assets">
+    <section class="project-list" id="project-list-view" hidden>
+      <div class="board-toolbar">
+        <button class="btn btn-quiet" type="button" id="list-mode-toggle">层级</button>
+      </div>
+      <div id="subproject-list-view"></div>
+    </section>
+
+    <section class="project-panel" data-project-panel="overview" hidden>
+      <div class="two-col">
+        <section class="panel">
+          <div class="panel-head"><span>子项目信息</span>
+            <span class="panel-actions"><button class="btn btn-danger btn-small"
+              type="button" id="delete-subproject">删除子项目</button></span></div>
+          <div class="stack-form">
+            <label class="field"><span>名称</span>
+              <input id="detail-name"></label>
+            <label class="field"><span>简介</span>
+              <textarea id="detail-description" rows="3"></textarea></label>
+            <div class="timing-grid">
+              <label class="field compact"><span>分类</span>
+                <select id="detail-category"></select></label>
+              <label class="field compact"><span>泳道</span>
+                <select id="detail-lane"></select></label>
+              <label class="field compact"><span>截止日期</span>
+                <input id="detail-due" type="date"></label>
+              <label class="field compact checkbox"><span>已完成</span>
+                <input id="detail-done" type="checkbox"></label>
+            </div>
+            <div class="form-actions">
+              <button class="btn" type="button" id="save-subproject-info">保存信息</button>
+              <span class="form-message" id="detail-message"></span>
+            </div>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><span>子任务</span>
+            <span class="panel-count" id="detail-subtask-count">0</span></div>
+          <div class="form-actions">
+            <input id="new-subtask-title" placeholder="新子任务">
+            <button class="btn btn-quiet" type="button" id="add-subtask">添加</button>
+          </div>
+          <div id="detail-subtasks"></div>
+        </section>
+      </div>
+      <div class="two-col">
+        <section class="panel">
+          <div class="panel-head"><span>内部关联</span></div>
+          <div id="detail-internal-links"></div>
+          <div class="form-actions">
+            <select id="new-internal-target"></select>
+            <input id="new-internal-label" placeholder="标签（可选）">
+            <button class="btn btn-quiet" type="button" id="add-internal-link">添加</button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><span>外部关联</span></div>
+          <div id="detail-external-links"></div>
+          <div class="form-actions">
+            <input id="new-external-label" placeholder="标签">
+            <input id="new-external-url" placeholder="https://...">
+            <button class="btn btn-quiet" type="button" id="add-external-link">添加</button>
+          </div>
+        </section>
+      </div>
+      <div class="two-col">
+        <section class="panel">
+          <div class="panel-head"><span>附件</span></div>
+          <div id="detail-attachments"></div>
+          <div class="form-actions">
+            <input type="file" id="attachment-file">
+            <button class="btn btn-quiet" type="button" id="add-attachment">添加附件</button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><span>评论</span></div>
+          <div id="detail-comments"></div>
+          <div class="form-actions">
+            <textarea id="new-comment" rows="2" placeholder="添加评论"></textarea>
+            <button class="btn btn-quiet" type="button" id="add-comment">发表</button>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section class="project-panel" data-project-panel="import" hidden>
       <div class="two-col">
         <section class="panel">
           <div class="panel-head"><span>素材与导入</span></div>
@@ -135,8 +259,12 @@
       </div>
     </section>
 
-    <section class="project-panel" data-project-panel="editor" hidden>
+    <section class="project-panel" data-project-panel="subtitle" hidden>
       <div class="project-context-strip" id="editor-context"></div>
+      <div class="form-actions">
+        <button class="btn btn-quiet" type="button" id="open-styles">样式表</button>
+        <button class="btn btn-quiet" type="button" id="open-transcript">查看转写稿</button>
+      </div>
       <div class="workspace-grid editor-grid">
         <section class="panel cue-panel">
           <div class="panel-head"><span>字幕行</span>
@@ -234,6 +362,8 @@
       <div class="two-col">
         <section class="panel">
           <div class="panel-head"><span>样式表</span>
+            <span class="panel-actions"><button class="btn btn-quiet" type="button"
+              id="back-to-subtitle">返回字幕编辑</button></span>
             <span class="panel-count" id="style-count">0</span></div>
           <div class="table-wrap"><table class="data-table" id="style-table">
             <thead><tr><th>名称</th><th>字体</th><th>字号</th><th>主色</th><th>描边</th><th>对齐</th></tr></thead>
@@ -293,6 +423,8 @@
     <section class="project-panel" data-project-panel="qa" hidden>
       <div class="panel">
         <div class="panel-head"><span>质检与待办</span>
+          <span class="panel-actions"><button class="btn btn-quiet" type="button"
+            id="back-to-export">返回导出</button></span>
           <span class="panel-count" id="qa-count">0</span></div>
         <div class="form-actions">
           <button class="btn" id="run-qa">运行质检</button>
@@ -302,6 +434,46 @@
           <thead><tr><th>级别</th><th>类型</th><th>说明</th><th>证据</th><th>操作</th></tr></thead>
           <tbody></tbody></table></div>
       </div>
+    </section>
+
+    <section class="project-panel" data-project-panel="transcribe" hidden>
+      <div class="info-box">
+        <h2>转录</h2>
+        <p>暂未实现</p>
+      </div>
+    </section>
+
+    <section class="project-panel" data-project-panel="mt" hidden>
+      <div class="info-box">
+        <h2>机器翻译</h2>
+        <p>暂未实现</p>
+      </div>
+    </section>
+
+    <section class="project-panel" data-project-panel="text" hidden>
+      <section class="panel">
+        <div class="panel-head"><span>文本编辑</span>
+          <span class="panel-actions">
+            <button class="btn btn-quiet" type="button" data-action="segment">分句</button>
+            <button class="btn btn-quiet" type="button" data-action="translate">机器翻译</button>
+          </span></div>
+        <div class="table-wrap"><table class="data-table" id="text-segment-table">
+          <thead><tr><th>#</th><th>原文</th><th>译文</th><th>状态</th></tr></thead>
+          <tbody></tbody></table></div>
+        <div class="form-message" id="text-message"></div>
+      </section>
+    </section>
+
+    <section class="project-panel" data-project-panel="export" hidden>
+      <section class="panel">
+        <div class="panel-head"><span>导出与渲染</span></div>
+        <div class="form-actions">
+          <button class="btn" type="button" data-action="style">导出 ASS</button>
+          <button class="btn" type="button" data-action="render">渲染视频</button>
+          <button class="btn btn-quiet" type="button" id="open-qa">打开质检</button>
+        </div>
+        <div class="form-message" id="export-message"></div>
+      </section>
     </section>
 
     <div id="project-detail-body" hidden></div>
@@ -410,97 +582,48 @@
   </section>
 
   <section class="tab-panel" data-panel="settings">
-    <div class="settings-grid">
-      <section class="panel">
-        <div class="panel-head"><span>ASR 服务</span></div>
-        <div class="stack-form">
-          <label class="field"><span>模式</span>
-            <select id="settings-asr-mode">
-              <option value="local">本地服务（无需 API Key）</option>
-              <option value="cloud">云端 API</option>
-            </select></label>
-          <label class="field"><span>API Key</span>
-            <input id="settings-asr-api-key" type="password" autocomplete="off"
-              placeholder="留空则保留当前 Key"></label>
-          <label class="field checkbox"><span>清除 ASR Key</span>
-            <input id="settings-asr-clear-key" type="checkbox"></label>
-          <div class="form-message" id="settings-asr-key-state"></div>
-          <div class="form-message">本地 ASR 地址由服务端配置（<code>NCAT_ASR_LOCAL_URL</code>）；
-            云端地址与模型由 <code>NCAT_ASR_CLOUD_URL</code> / <code>NCAT_ASR_CLOUD_MODEL</code> 配置。</div>
-        </div>
-      </section>
-      <section class="panel">
-        <div class="panel-head"><span>MT 服务</span></div>
-        <div class="stack-form">
-          <label class="field"><span>模式</span>
-            <select id="settings-mt-mode">
-              <option value="local">本地服务（无需 API Key）</option>
-              <option value="cloud">云端 API</option>
-            </select></label>
-          <label class="field"><span>API Key</span>
-            <input id="settings-mt-api-key" type="password" autocomplete="off"
-              placeholder="留空则保留当前 Key"></label>
-          <label class="field checkbox"><span>清除 MT Key</span>
-            <input id="settings-mt-clear-key" type="checkbox"></label>
-          <div class="form-message" id="settings-mt-key-state"></div>
-          <div class="form-message">本地 MT 地址由服务端配置（<code>NCAT_MT_LOCAL_URL</code>）；
-            云端地址与模型由 <code>NCAT_MT_CLOUD_URL</code> / <code>NCAT_MT_CLOUD_MODEL</code> 配置。</div>
-        </div>
-      </section>
+    <div class="settings-shell">
+      <aside class="settings-nav" id="settings-nav">
+        <button class="settings-nav-item is-active" type="button"
+          data-settings-section="providers">提供商</button>
+      </aside>
+      <div class="settings-main">
+        <section class="settings-section" data-settings-panel="providers">
+          <div class="provider-active-grid">
+            <label class="field compact"><span>ASR 当前提供商</span>
+              <select id="settings-asr-active"></select></label>
+            <label class="field compact"><span>MT 当前提供商</span>
+              <select id="settings-mt-active"></select></label>
+          </div>
+          <div class="settings-empty" id="settings-provider-empty">还没有提供商。</div>
+          <div class="settings-provider-actions">
+            <button class="btn provider-add" type="button" id="settings-add-asr">添加 ASR 提供商</button>
+            <button class="btn provider-add" type="button" id="settings-add-mt">添加 MT 提供商</button>
+          </div>
+          <div class="provider-list" id="settings-provider-list"></div>
+          <div class="form-message" id="settings-message"></div>
+        </section>
+      </div>
     </div>
-    <div class="form-actions">
-      <button class="btn" id="settings-save">保存设置</button>
-      <span class="form-message" id="settings-message"></span>
-    </div>
-    <div id="model-list" hidden></div>
   </section>
-
 </main>
 
 <dialog id="project-dialog" class="modal">
   <form class="modal-box" id="project-form" method="dialog">
     <h3>新建项目</h3>
     <label class="field"><span>名称</span>
-      <input id="new-name" placeholder="客户 / 长期项目"></label>
-    <label class="field"><span>客户</span>
-      <input id="new-client" placeholder="可选"></label>
-    <div class="timing-grid">
-      <label class="field compact"><span>源语言</span>
-        <input id="new-source-lang" value="en"></label>
-      <label class="field compact"><span>目标语言</span>
-        <input id="new-target-lang" value="zh-Hans"></label>
-    </div>
-    <label class="field"><span>初始素材（可选）</span>
-      <input id="new-source" placeholder="/path/to/video-or-text"></label>
-    <label class="field"><span>首个子项目名称</span>
-      <input id="new-subproject-name" value="Main"></label>
+      <input id="new-name" autocomplete="off"></label>
+    <label class="field"><span>布局</span>
+      <select id="new-layout">
+        <option value="default">默认：分类 + 8 泳道 + 全部功能</option>
+        <option value="empty">空项目：无分类/泳道，功能关闭</option>
+      </select></label>
     <div class="form-actions">
       <button class="btn" type="submit">创建项目</button>
       <button class="btn btn-quiet" type="button" id="cancel-project">取消</button>
     </div>
     <div class="form-message" id="project-message"></div>
   </form>
-</dialog>
-
-<dialog id="subproject-dialog" class="modal">
-  <div class="modal-box">
-    <h3>添加子项目</h3>
-    <div class="timing-grid">
-      <label class="field compact"><span>名称</span>
-        <input id="sub-name" placeholder="视频 / 文章 / 批次"></label>
-      <label class="field compact"><span>类型</span>
-        <select id="sub-kind">
-          <option value="video">视频</option>
-          <option value="text">文本</option>
-        </select></label>
-      <label class="field compact"><span>源文件路径（可选）</span>
-        <input id="sub-source" placeholder="/path/to/source"></label>
-    </div>
-    <div class="form-actions">
-      <button class="btn" id="add-subproject" type="button">添加子项目</button>
-      <button class="btn btn-quiet" id="cancel-subproject" type="button">取消</button>
-    </div>
-  </div>
 </dialog>
 
 <dialog id="transcribe-dialog" class="modal">
@@ -521,5 +644,125 @@
 </dialog>
 
 <div class="toast" id="toast" hidden></div>
+
+<dialog id="provider-dialog" class="modal">
+  <form class="modal-box" id="provider-form" method="dialog">
+    <h3 id="provider-dialog-title">添加提供商</h3>
+    <input type="hidden" id="provider-id">
+    <input type="hidden" id="provider-service">
+    <label class="field"><span>Provider ID</span>
+      <input id="provider-provider-id" autocomplete="off"></label>
+    <label class="field"><span>Provider Name</span>
+      <input id="provider-provider-name" autocomplete="off"></label>
+    <label class="field"><span>API Type</span>
+      <select id="provider-api-type"></select></label>
+    <label class="field"><span>Endpoint / Base URL</span>
+      <input id="provider-base-url" autocomplete="off"
+        placeholder="必填，例如 https://api.example.com/v1"></label>
+    <div class="field">
+      <span>API Key</span>
+      <div class="key-row">
+        <input id="provider-api-key" type="password" autocomplete="off"
+          placeholder="留空则保留当前 Key">
+        <button class="btn btn-quiet" type="button" id="provider-clear-key">清除</button>
+      </div>
+      <div class="form-message key-clear-message" id="provider-clear-message"></div>
+    </div>
+    <label class="field"><span>Header 请求头（可选）</span>
+      <textarea id="provider-headers" rows="3"
+        placeholder="每行一个：X-Header: value"></textarea></label>
+    <label class="field"><span>默认模型</span>
+      <select id="provider-default-model"></select></label>
+    <div class="form-actions model-actions">
+      <button class="btn btn-quiet" type="button"
+        id="provider-fetch-models">获取模型</button>
+      <span class="form-message" id="provider-fetch-message"></span>
+    </div>
+    <div class="form-message" id="provider-key-state"></div>
+    <label class="field checkbox"><span>忽略运行状态检查</span>
+      <input id="provider-ignore-health" type="checkbox"></label>
+    <div class="form-actions">
+      <button class="btn" type="submit" id="provider-submit">添加</button>
+      <button class="btn btn-quiet" type="button" id="provider-cancel">取消</button>
+    </div>
+    <div class="form-message" id="provider-message"></div>
+  </form>
+</dialog>
+
+
+<dialog id="project-info-dialog" class="modal">
+  <form class="modal-box" id="project-info-form" method="dialog">
+    <h3>编辑项目信息</h3>
+    <label class="field"><span>项目名称</span>
+      <input id="edit-project-name" autocomplete="off"></label>
+    <div class="form-actions">
+      <button class="btn" type="submit">保存</button>
+      <button class="btn btn-quiet" type="button" id="cancel-project-info">取消</button>
+    </div>
+    <div class="form-message" id="project-info-message"></div>
+  </form>
+</dialog>
+
+<dialog id="board-settings-dialog" class="modal">
+  <div class="modal-box modal-wide">
+    <h3>编辑看板</h3>
+    <div class="form-actions">
+      <input id="new-category-name" placeholder="新分类名称">
+      <button class="btn btn-quiet" type="button" id="add-category">添加分类</button>
+    </div>
+    <div id="board-settings-list" class="board-settings-list"></div>
+    <div class="form-actions">
+      <button class="btn btn-quiet" type="button" id="close-board-settings">关闭</button>
+    </div>
+    <div class="form-message" id="board-settings-message"></div>
+  </div>
+</dialog>
+
+<dialog id="project-settings-dialog" class="modal">
+  <div class="modal-box modal-wide">
+    <h3>项目设置</h3>
+    <h4>功能开关</h4>
+    <div class="feature-grid" id="feature-grid"></div>
+    <h4>自动化规则</h4>
+    <div class="form-actions">
+      <input id="rule-subtask-title" list="subtask-title-options"
+        placeholder="子任务标题">
+      <datalist id="subtask-title-options"></datalist>
+      <select id="rule-target-category"></select>
+      <select id="rule-target-lane"></select>
+      <button class="btn btn-quiet" type="button" id="add-rule">添加规则</button>
+    </div>
+    <div id="automation-list"></div>
+    <div class="form-actions">
+      <button class="btn btn-quiet" type="button" id="close-project-settings">关闭</button>
+    </div>
+    <div class="form-message" id="project-settings-message"></div>
+  </div>
+</dialog>
+
+<dialog id="model-dialog" class="modal">
+  <form class="modal-box" id="model-form" method="dialog">
+    <h3>添加自定义模型</h3>
+    <label class="field"><span>Model ID</span>
+      <input id="model-id" autocomplete="off"></label>
+    <label class="field"><span>Model Name</span>
+      <input id="model-name" autocomplete="off"></label>
+    <div id="model-extra" hidden>
+      <label class="field checkbox"><span>Reasoning / 推理模型</span>
+        <input id="model-reasoning" type="checkbox"></label>
+      <label class="field checkbox"><span>Image / 图像多模态</span>
+        <input id="model-image" type="checkbox"></label>
+    </div>
+    <div class="form-actions">
+      <button class="btn" type="submit">添加</button>
+      <button class="btn btn-quiet" type="button" id="model-cancel">取消</button>
+    </div>
+    <div class="form-message" id="model-message"></div>
+  </form>
+</dialog>
+
+
+
+
 </body>
 </html>

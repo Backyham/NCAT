@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,7 +24,7 @@ from .types import (
     Project, Term, TermStatus, TermType, TMUnit,
 )
 
-SCHEMA = 2
+SCHEMA = 3
 TERMBASE_DIR = "termbases"
 TM_DIR = "tm"
 SUBPROJECT_DIR = "subprojects"
@@ -45,6 +46,91 @@ def _atomic_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+DEFAULT_FEATURES = {
+    "ffmpeg": True,
+    "asr": True,
+    "segment": True,
+    "timing": True,
+    "mt": True,
+    "subtitle_edit": True,
+    "export": True,
+}
+
+DEFAULT_LANE_NAMES = [
+    "待素材", "待转写", "待分段", "翻译中",
+    "待审校", "待导出", "已交付", "已归档",
+]
+DEFAULT_CATEGORY_NAME = "默认"
+UNCLASSIFIED_NAME = "未分类"
+
+
+@dataclass
+class Lane:
+    id: str
+    name: str
+    order: int = 0
+
+
+@dataclass
+class Category:
+    id: str
+    name: str
+    order: int = 0
+    lanes: list[Lane] = field(default_factory=list)
+
+
+@dataclass
+class Subtask:
+    id: str
+    title: str
+    done: bool = False
+    order: int = 0
+    created_at: str | None = None
+    completed_at: str | None = None
+
+
+@dataclass
+class InternalLink:
+    id: str
+    target_subproject_id: str
+    label: str = ""
+
+
+@dataclass
+class ExternalLink:
+    id: str
+    label: str
+    url: str
+
+
+@dataclass
+class Comment:
+    id: str
+    body: str
+    created_at: str | None = None
+
+
+@dataclass
+class Attachment:
+    id: str
+    name: str
+    size: int = 0
+    content_type: str = ""
+    created_at: str | None = None
+    path: str = ""
+
+
+@dataclass
+class AutomationRule:
+    id: str
+    subtask_title: str
+    target_category_id: str
+    target_lane_id: str
+    category_scope_id: str | None = None
+    enabled: bool = True
+    order: int = 0
+
+
 @dataclass
 class Subproject:
     id: str
@@ -55,6 +141,17 @@ class Subproject:
     target_langs: list[str] = field(default_factory=lambda: ["zh-Hans"])
     termbase_ids: list[str] = field(default_factory=list)
     tm_ids: list[str] = field(default_factory=list)
+    category_id: str = ""
+    lane_id: str = ""
+    description: str = ""
+    due: str | None = None
+    done: bool = False
+    completed_at: str | None = None
+    subtasks: list[Subtask] = field(default_factory=list)
+    internal_links: list[InternalLink] = field(default_factory=list)
+    external_links: list[ExternalLink] = field(default_factory=list)
+    comments: list[Comment] = field(default_factory=list)
+    attachments: list[Attachment] = field(default_factory=list)
     workflow: dict[str, Any] = field(default_factory=dict)
     created_at: str | None = None
     updated_at: str | None = None
@@ -90,6 +187,10 @@ class WorkspaceProject:
     client: str = ""
     source_lang: str = "en"
     target_langs: list[str] = field(default_factory=lambda: ["zh-Hans"])
+    categories: list[Category] = field(default_factory=list)
+    features: dict[str, bool] = field(
+        default_factory=lambda: dict(DEFAULT_FEATURES))
+    automation: list[AutomationRule] = field(default_factory=list)
     subprojects: list[Subproject] = field(default_factory=list)
     termbases: list[TermbaseRef] = field(default_factory=list)
     tm: list[TMRef] = field(default_factory=list)
@@ -109,6 +210,9 @@ class WorkspaceProject:
             "client": self.client,
             "source_lang": self.source_lang,
             "target_langs": self.target_langs,
+            "categories": [asdict(item) for item in self.categories],
+            "features": dict(self.features),
+            "automation": [asdict(item) for item in self.automation],
             "subprojects": [asdict(item) for item in self.subprojects],
             "termbases": [asdict(item) for item in self.termbases],
             "tm": [asdict(item) for item in self.tm],
@@ -130,6 +234,104 @@ class WorkspaceProject:
         return (self.root / subproject.dir).resolve()
 
 
+def category_of(project: WorkspaceProject, category_id: str) -> Category:
+    for category in project.categories:
+        if category.id == category_id:
+            return category
+    raise FileNotFoundError(f"category not found: {category_id}")
+
+
+def lane_of(project: WorkspaceProject, category: Category,
+            lane_id: str) -> Lane:
+    for lane in category.lanes:
+        if lane.id == lane_id:
+            return lane
+    raise FileNotFoundError(f"lane not found: {lane_id}")
+
+
+def add_category(project: WorkspaceProject, name: str) -> Category:
+    category = Category(
+        id=new_id("cat"), name=name.strip() or DEFAULT_CATEGORY_NAME,
+        order=len(project.categories),
+    )
+    project.categories.append(category)
+    return category
+
+
+def add_lane(project: WorkspaceProject, category: Category,
+             name: str) -> Lane:
+    lane = Lane(id=new_id("lane"), name=name.strip() or "新泳道",
+                order=len(category.lanes))
+    category.lanes.append(lane)
+    return lane
+
+
+def update_category(project: WorkspaceProject, category_id: str, *,
+                    name: str | None = None,
+                    order: int | None = None) -> Category:
+    category = category_of(project, category_id)
+    if name is not None:
+        category.name = name.strip() or category.name
+    if order is not None:
+        category.order = int(order)
+    save_workspace(project)
+    return category
+
+
+def delete_category(project: WorkspaceProject, category_id: str) -> Category:
+    category = category_of(project, category_id)
+    if any(sub.category_id == category_id for sub in project.subprojects):
+        raise ValueError("category still contains subprojects")
+    project.categories = [item for item in project.categories
+                          if item.id != category_id]
+    save_workspace(project)
+    return category
+
+
+def update_lane(project: WorkspaceProject, category_id: str, lane_id: str,
+                *, name: str | None = None,
+                order: int | None = None) -> Lane:
+    category = category_of(project, category_id)
+    lane = lane_of(project, category, lane_id)
+    if name is not None:
+        lane.name = name.strip() or lane.name
+    if order is not None:
+        lane.order = int(order)
+    save_workspace(project)
+    return lane
+
+
+def delete_lane(project: WorkspaceProject, category_id: str,
+                lane_id: str) -> Lane:
+    category = category_of(project, category_id)
+    lane = lane_of(project, category, lane_id)
+    if any(sub.category_id == category_id and sub.lane_id == lane_id
+           for sub in project.subprojects):
+        raise ValueError("lane still contains subprojects")
+    category.lanes = [item for item in category.lanes
+                      if item.id != lane_id]
+    save_workspace(project)
+    return lane
+
+
+def default_layout(project: WorkspaceProject) -> Category:
+    category = add_category(project, DEFAULT_CATEGORY_NAME)
+    for lane_name in DEFAULT_LANE_NAMES:
+        add_lane(project, category, lane_name)
+    project.features = dict(DEFAULT_FEATURES)
+    return category
+
+
+def unclassified_layout(project: WorkspaceProject) -> Category:
+    category = add_category(project, UNCLASSIFIED_NAME)
+    lane = add_lane(project, category, UNCLASSIFIED_NAME)
+    for sub in project.subprojects:
+        sub.category_id = category.id
+        sub.lane_id = lane.id
+    project.features = dict(DEFAULT_FEATURES)
+    return category
+
+
 def create_workspace(
     root: str | Path,
     name: str,
@@ -140,6 +342,7 @@ def create_workspace(
     source_path: str | Path | None = None,
     subproject_name: str = "Main",
     kind: str = "video",
+    layout: str = "default",
     force: bool = False,
 ) -> WorkspaceProject:
     root = Path(root).expanduser().resolve()
@@ -157,11 +360,19 @@ def create_workspace(
         created_at=now_iso(),
         updated_at=now_iso(),
     )
+    category = None
+    if layout != "empty":
+        category = default_layout(project)
+    else:
+        project.features = {key: False for key in DEFAULT_FEATURES}
     if source_path is not None or subproject_name:
+        lane = category.lanes[0] if category and category.lanes else None
         add_subproject(
             project, subproject_name, kind=kind,
             source_path=source_path, source_lang=source_lang,
             target_langs=list(target_langs),
+            category_id=category.id if category else "",
+            lane_id=lane.id if lane else "",
         )
     save_workspace(project)
     return project
@@ -175,7 +386,19 @@ def add_subproject(
     source_path: str | Path | None = None,
     source_lang: str | None = None,
     target_langs: Iterable[str] | None = None,
+    category_id: str = "",
+    lane_id: str = "",
 ) -> Subproject:
+    if not category_id:
+        if not project.categories:
+            raise ValueError("layout_required")
+        category_id = project.categories[0].id
+    category = category_of(project, category_id)
+    if not lane_id:
+        if not category.lanes:
+            raise ValueError("layout_required")
+        lane_id = category.lanes[0].id
+    lane_of(project, category, lane_id)
     base = _slug(name, "subproject")
     directory = project.root / SUBPROJECT_DIR / base
     counter = 2
@@ -195,6 +418,16 @@ def add_subproject(
         dir=str(directory.relative_to(project.root)),
         source_lang=state.project.source_lang,
         target_langs=list(state.project.target_langs),
+        category_id=category.id,
+        lane_id=lane_id,
+        subtasks=[
+            Subtask(
+                id=new_id("task"), title=lane.name, order=index,
+                created_at=now_iso(),
+            )
+            for index, lane in enumerate(category.lanes)
+            if lane.name != UNCLASSIFIED_NAME
+        ],
         created_at=now_iso(),
         updated_at=now_iso(),
     )
@@ -203,15 +436,51 @@ def add_subproject(
     return subproject
 
 
+def _subproject_from_payload(item: dict[str, Any]) -> Subproject:
+    data = dict(item)
+    for key, cls in (
+        ("subtasks", Subtask), ("internal_links", InternalLink),
+        ("external_links", ExternalLink), ("comments", Comment),
+        ("attachments", Attachment),
+    ):
+        data[key] = [cls(**row) for row in data.get(key, []) if isinstance(row, dict)]
+    data.setdefault("category_id", "")
+    data.setdefault("lane_id", "")
+    data.setdefault("description", "")
+    data.setdefault("done", False)
+    data.setdefault("completed_at", None)
+    if not data.get("due") and isinstance(data.get("workflow"), dict):
+        data["due"] = data["workflow"].get("due")
+    return Subproject(**data)
+
+
+def _categories_from_payload(payload: dict[str, Any]) -> list[Category]:
+    categories = []
+    for raw in payload.get("categories", []):
+        if not isinstance(raw, dict):
+            continue
+        lanes = [Lane(**lane) for lane in raw.get("lanes", [])
+                 if isinstance(lane, dict)]
+        categories.append(Category(
+            id=raw["id"], name=raw.get("name", ""),
+            order=int(raw.get("order", 0)), lanes=lanes,
+        ))
+    categories.sort(key=lambda item: item.order)
+    for category in categories:
+        category.lanes.sort(key=lambda item: item.order)
+    return categories
+
+
 def load_workspace(root: str | Path) -> WorkspaceProject:
     root = Path(root).expanduser().resolve()
     project_file = root / PROJECT_FILE
     if not project_file.is_file():
         raise FileNotFoundError(f"no {PROJECT_FILE} in {root}")
     payload = json.loads(project_file.read_text(encoding="utf-8-sig"))
-    if int(payload.get("schema", 1)) < 2:
+    schema = int(payload.get("schema", 1))
+    if schema < 2:
         state = load_project(root)
-        return WorkspaceProject(
+        project = WorkspaceProject(
             id=state.project.id,
             name=state.project.name,
             root=root,
@@ -228,22 +497,37 @@ def load_workspace(root: str | Path) -> WorkspaceProject:
             created_at=state.project.created_at,
             updated_at=state.project.updated_at,
         )
-    subprojects = [Subproject(**item)
-                   for item in payload.get("subprojects", [])]
-    return WorkspaceProject(
+        unclassified_layout(project)
+        save_workspace(project)
+        return project
+
+    project = WorkspaceProject(
         id=payload["id"],
         name=payload["name"],
         root=root,
         client=payload.get("client", ""),
         source_lang=payload.get("source_lang", "en"),
         target_langs=payload.get("target_langs", ["zh-Hans"]),
-        subprojects=subprojects,
+        categories=_categories_from_payload(payload),
+        features={
+            **DEFAULT_FEATURES,
+            **(payload.get("features") or {}),
+        },
+        automation=[AutomationRule(**item)
+                    for item in payload.get("automation", [])
+                    if isinstance(item, dict)],
+        subprojects=[_subproject_from_payload(item)
+                     for item in payload.get("subprojects", [])],
         termbases=[TermbaseRef(**item)
                    for item in payload.get("termbases", [])],
         tm=[TMRef(**item) for item in payload.get("tm", [])],
         created_at=payload.get("created_at"),
         updated_at=payload.get("updated_at"),
     )
+    if schema < 3:
+        unclassified_layout(project)
+        save_workspace(project)
+    return project
 
 
 def save_workspace(project: WorkspaceProject) -> Path:
@@ -261,12 +545,59 @@ def subproject_state(project: WorkspaceProject,
 
 def update_subproject(project: WorkspaceProject, subproject_id: str,
                       **changes: Any) -> Subproject:
-    subproject = project.subproject(subproject_id)
-    for key in ("name", "kind", "termbase_ids", "tm_ids"):
+    subproject = next((item for item in project.subprojects
+                       if item.id == subproject_id), None)
+    if subproject is None:
+        raise FileNotFoundError(f"subproject not found: {subproject_id}")
+    if "category_id" in changes and changes["category_id"] != subproject.category_id:
+        category = category_of(project, str(changes["category_id"]))
+        if not category.lanes:
+            raise ValueError("lane_required")
+        subproject.category_id = category.id
+        subproject.lane_id = category.lanes[0].id
+    if "lane_id" in changes and changes["lane_id"] != subproject.lane_id:
+        if not subproject.category_id:
+            raise ValueError("category is required before lane")
+        category = category_of(project, subproject.category_id)
+        lane_of(project, category, str(changes["lane_id"]))
+        subproject.lane_id = str(changes["lane_id"])
+    for key in ("name", "kind", "description", "due", "termbase_ids",
+                "tm_ids", "internal_links", "external_links", "comments",
+                "attachments", "subtasks"):
         if key in changes:
             setattr(subproject, key, changes[key])
+    if "done" in changes:
+        done = bool(changes["done"])
+        if done and not subproject.done:
+            subproject.completed_at = now_iso()
+        elif not done:
+            subproject.completed_at = None
+        subproject.done = done
     subproject.updated_at = now_iso()
     save_workspace(project)
+    return subproject
+
+
+def delete_subproject(project: WorkspaceProject, subproject_id: str) -> Subproject:
+    """Remove a subproject and its directory from the workspace.
+
+    Legacy projects expose their root as a subproject (``dir`` ``.``); deleting
+    that entry is refused to avoid removing the workspace itself.
+    """
+    subproject = next((item for item in project.subprojects
+                       if item.id == subproject_id), None)
+    if subproject is None:
+        raise FileNotFoundError(f"subproject not found: {subproject_id}")
+    if subproject.dir in ("", "."):
+        raise ValueError("cannot delete a legacy project root subproject")
+    directory = project.subproject_root(subproject)
+    root = project.root.resolve()
+    if directory == root or root not in directory.parents:
+        raise ValueError(f"refusing to delete outside project: {directory}")
+    project.subprojects = [item for item in project.subprojects
+                           if item.id != subproject.id]
+    save_workspace(project)
+    shutil.rmtree(directory, ignore_errors=True)
     return subproject
 
 

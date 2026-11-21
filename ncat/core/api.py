@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from ncat import __version__
+
 API_KEY_PRIMARY = "NCAT_API_KEY"
 API_KEY_FALLBACKS = ("OPENAI_API_KEY",)
 
@@ -94,7 +96,10 @@ def request_json(
     retries: int = 2,
     retry_backoff: float = 1.0,
 ) -> Any:
-    request_headers = {"Content-Type": "application/json"}
+    request_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": f"NCAT/{__version__}",
+    }
     if headers:
         request_headers.update(headers)
     request_headers.update(auth_headers(api_key, extra_headers=extra_headers))

@@ -41,6 +41,12 @@ def get_backend(name: str) -> MTBackend:
     if name == "openai_compatible":
         from .llama_cpp import OpenAICompatibleBackend
         return OpenAICompatibleBackend()
+    if name == "openai_responses":
+        from .openai_responses import OpenAIResponsesBackend
+        return OpenAIResponsesBackend()
+    if name == "anthropic":
+        from .anthropic import AnthropicBackend
+        return AnthropicBackend()
     raise KeyError(
         f"unknown MT backend {name!r}; register with NCAT_MT_PLUGINS "
         "or use llama_cpp")

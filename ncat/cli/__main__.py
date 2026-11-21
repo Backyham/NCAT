@@ -3,60 +3,37 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from ncat import __version__
-from ncat.core.align import align_cues_to_words
+from ncat.core.actions import (
+    ActionError, list_backends, parse_options,
+    project_terms_tm as _project_terms_tm, run_align, run_ingest,
+    run_render, run_segment, run_style, run_transcribe, run_translate,
+)
 from ncat.core.assets.tm import (
-    find_matches, read_tmx, read_units, write_tmx, write_units,
+    find_matches, read_units, write_tmx, write_units,
 )
 from ncat.core.assets.termbase import (
-    import_table, match_terms, read_terms, read_tbx, write_tbx, write_terms,
+    import_table, match_terms, read_terms, write_tbx, write_terms,
 )
 from ncat.core.corpus import build_and_write
-from ncat.core.mt import get_backend as get_mt_backend
-from ncat.core.mt.base import MTRequest, SegmentInput
 from ncat.core.qa import read_qa, run_qa, update_qa, write_qa
-from ncat.core.workspace import (
-    effective_terms, effective_tm, find_workspace_for, subproject_state,
-)
-from ncat.core.asr import (
-    ASRRequest, describe_backends, get_backend, load_plugins,
-)
 from ncat.core.asr.base import ASRError
 from ncat.core.index import build_index, search_index
-from ncat.core.media import (
-    MediaError, file_checksum, probe_media, render_subtitles,
-    transcode_source,
-)
+from ncat.core.media import MediaError
 from ncat.core.project import (
     create_project, load_project, new_id, read_cues, read_segments,
     save_project, write_cues, write_segments,
 )
-from ncat.core.segment import (
-    load_bilingual_pair, read_lines, segments_from_pairs,
-    segments_from_source_text, segments_from_transcript,
-)
-from ncat.core.subs.model import (
-    cues_from_segments, export_ass, merge_cues, split_bilingual_text,
-    split_cue,
-)
+from ncat.core.segment import load_bilingual_pair
+from ncat.core.subs.model import merge_cues, split_cue
 from ncat.core.subs.rules import apply_all
-from ncat.core.runs import (
-    fail_run, finish_run, finish_step, latest_run, new_run, save_run,
-    start_step,
-)
+from ncat.core.runs import latest_run
 from ncat.core.text import source_hash
-from ncat.core.transcript import (
-    apply_offset, finalize_transcript, load_transcript, save_transcript,
-    write_transcript_text,
-)
-from ncat.core.types import (
-    Cue, ProjectStage, QAStatus, RunStatus, SegmentStatus, StepStatus,
-)
+from ncat.core.types import Cue, QAStatus, SegmentStatus
 
 COMMANDS = [
     ("init", "create a project"),
@@ -78,15 +55,8 @@ COMMANDS = [
 ]
 
 
-class CLIError(Exception):
-    def __init__(self, code: str, message: str, *,
-                 fields: dict[str, Any] | None = None,
-                 exit_code: int = 1) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.fields = fields
-        self.exit_code = exit_code
+class CLIError(ActionError):
+    """Backwards-compatible name for CLI-side action errors."""
 
 
 def _json_mode(args: argparse.Namespace) -> bool:
@@ -112,44 +82,6 @@ def _emit_error(args: argparse.Namespace, code: str, message: str,
               file=sys.stderr)
         return
     print(f"ncat: {message}", file=sys.stderr)
-
-
-def _parse_options(values: list[str] | None) -> dict[str, Any]:
-    """Parse repeatable ``KEY=VALUE`` backend options, JSON-coercing values."""
-    options: dict[str, Any] = {}
-    for raw in values or []:
-        if "=" not in raw:
-            raise CLIError(
-                "invalid_argument",
-                f"--option expects KEY=VALUE, got {raw!r}",
-            )
-        key, value = raw.split("=", 1)
-        key = key.strip()
-        if not key:
-            raise CLIError("invalid_argument",
-                           f"--option has an empty key: {raw!r}")
-        try:
-            options[key] = json.loads(value)
-        except json.JSONDecodeError:
-            options[key] = value
-    return options
-
-
-def _begin_run(state, recipe: str):
-    run = new_run(state.project.id, recipe=recipe)
-    save_run(state.paths, run)
-    return run
-
-
-def _fail_run(state, run, error: Exception) -> None:
-    fail_run(run, str(error))
-    save_run(state.paths, run)
-
-
-def _pause_requested(args: argparse.Namespace, state) -> bool:
-    if args.pause_after_transcript is None:
-        return state.project.pause_for_transcript_review
-    return bool(args.pause_after_transcript)
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -186,92 +118,21 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_ingest(args: argparse.Namespace) -> int:
     state = load_project(args.project)
-    if state.source is None or not state.source.path:
-        raise CLIError("missing_source",
-                       "project has no source; run init --source")
-    source = Path(state.source.path)
-    if not source.is_file():
-        raise CLIError("not_found", f"source not found: {source}")
-
-    run = _begin_run(state, "ingest")
-    try:
-        step = start_step(run, "checksum")
-        save_run(state.paths, run)
-        checksum = file_checksum(source)
-        finish_step(run, step, StepStatus.SUCCEEDED,
-                    message=checksum, artifacts=[str(source)])
-
-        proxy = state.paths.media / f"source-{args.height}p.mp4"
-        wav = state.paths.media / "source.wav"
-        settings = state.ingest or {}
-        reuse = bool(
-            not args.force
-            and state.source.checksum == checksum
-            and settings.get("height") == args.height
-            and settings.get("encoder")
-            and proxy.is_file()
-            and wav.is_file()
-        )
-        if reuse:
-            step = start_step(run, "reuse")
-            save_run(state.paths, run)
-            info = probe_media(source)
-            encoder = str(settings.get("encoder", ""))
-            finish_step(run, step, StepStatus.SUCCEEDED,
-                        message="checksum and settings match",
-                        artifacts=[str(proxy), str(wav)])
-        else:
-            step = start_step(run, "transcode")
-            save_run(state.paths, run)
-            result = transcode_source(
-                source, state.paths.media, stem="source",
-                height=args.height, encoder=args.encoder,
-            )
-            info = result.info
-            encoder = result.encoder
-            finish_step(run, step, StepStatus.SUCCEEDED,
-                        message=encoder,
-                        artifacts=[str(result.proxy), str(result.wav)])
-
-        state.source.proxy_path = str(proxy)
-        state.source.audio_path = str(wav)
-        state.source.duration_ms = info.duration_ms
-        state.source.width = info.width
-        state.source.height = info.height
-        state.source.fps = info.fps
-        state.source.checksum = checksum
-        state.source.status = "ready"
-        state.ingest = {"height": args.height, "encoder": encoder}
-        save_project(state)
-
-        finish_run(run, RunStatus.SUCCEEDED)
-        save_run(state.paths, run)
-        payload = {
-            "project": state.project.id,
-            "proxy": str(proxy),
-            "audio": str(wav),
-            "encoder": encoder,
-            "reused": reuse,
-            "checksum": checksum,
-            "run_id": run.id,
-            "run_status": str(run.status),
-        }
-        _emit(args, payload, [
-            f"proxy: {proxy}",
-            f"audio: {wav}",
-            f"encoder: {encoder}",
-            f"run: {run.id} ({run.status})",
-        ])
-        return 0
-    except Exception as error:
-        _fail_run(state, run, error)
-        raise
+    payload = run_ingest(
+        state, height=args.height, encoder=args.encoder, force=args.force)
+    _emit(args, payload, [
+        f"proxy: {payload['proxy']}",
+        f"audio: {payload['audio']}",
+        f"encoder: {payload['encoder']}",
+        f"run: {payload['run_id']} ({payload['run_status']})",
+    ])
+    return 0
 
 
 def _cmd_transcribe(args: argparse.Namespace) -> int:
-    load_plugins()
     if args.list_backends:
-        backends = describe_backends()
+        payload = list_backends()
+        backends = payload["backends"]
         lines = [
             f"{item['name']}: " + ", ".join(
                 f"{key}={value}" for key, value in item["capabilities"].items()
@@ -283,7 +144,7 @@ def _cmd_transcribe(args: argparse.Namespace) -> int:
             lines.append(
                 "no ASR backends registered; set "
                 "NCAT_ASR_PLUGINS=name=module:factory")
-        _emit(args, {"backends": backends}, lines)
+        _emit(args, payload, lines)
         return 0
 
     if not args.project:
@@ -291,104 +152,31 @@ def _cmd_transcribe(args: argparse.Namespace) -> int:
                        "transcribe requires a project (or --list-backends)")
 
     state = load_project(args.project)
-    if state.source is None or not state.source.audio_path:
-        raise CLIError("missing_audio",
-                       "project has no audio; run ingest first")
-    audio = Path(state.source.audio_path)
-    if not audio.is_file():
-        raise CLIError("not_found", f"audio not found: {audio}")
-
-    run = _begin_run(state, "transcribe")
-    try:
-        options = _parse_options(args.option)
-        if args.model and "model" not in options:
-            options["model"] = args.model
-        options.setdefault("source_id", state.source.id)
-        backend_name = args.backend or os.environ.get("NCAT_ASR_BACKEND", "")
-        if not backend_name:
-            raise CLIError(
-                "asr_not_configured",
-                "no ASR backend selected; register a custom backend with "
-                "NCAT_ASR_PLUGINS=name=module:factory and pass --backend name "
-                "(or set NCAT_ASR_BACKEND)",
-            )
-        backend = get_backend(backend_name)
-        language = (args.language or state.source.language
-                    or state.project.source_lang)
-
-        step = start_step(run, "asr")
-        save_run(state.paths, run)
-        transcript = backend.transcribe(ASRRequest(
-            audio_path=str(audio), language=language, options=options,
-        ))
-        finish_step(run, step, StepStatus.SUCCEEDED,
-                    message=f"{len(transcript.words)} words")
-
-        step = start_step(run, "finalize")
-        save_run(state.paths, run)
-        finalize_transcript(
-            transcript, offset_ms=args.offset_ms, chunk_ms=args.chunk_ms,
-        )
-        finish_step(run, step, StepStatus.SUCCEEDED,
-                    message=f"offset={args.offset_ms}ms "
-                            f"chunk={args.chunk_ms}ms")
-
-        step = start_step(run, "write")
-        save_run(state.paths, run)
-        json_path = state.paths.asr / "transcript.json"
-        text_path = state.paths.asr / "transcript.txt"
-        save_transcript(json_path, transcript)
-        write_transcript_text(text_path, transcript)
-        finish_step(run, step, StepStatus.SUCCEEDED,
-                    artifacts=[str(json_path), str(text_path)])
-
-        state.asr = {
-            "backend": transcript.backend,
-            "model": transcript.model,
-            "language": transcript.language,
-            "path": str(json_path),
-            "text_path": str(text_path),
-            "words": len(transcript.words),
-            "chunks": len(transcript.chunks),
-            "offset_ms": args.offset_ms,
-            "chunk_ms": args.chunk_ms,
-            "options": options,
-            "run_id": run.id,
+    fallback = None
+    if args.fallback_backend:
+        fallback = {
+            "backend": args.fallback_backend,
+            "model": args.fallback_model,
+            "options": parse_options(args.fallback_option),
         }
-        state.project.stage = ProjectStage.DRAFTING
-        save_project(state)
-
-        paused = _pause_requested(args, state)
-        finish_run(run, RunStatus.PAUSED if paused else RunStatus.SUCCEEDED)
-        save_run(state.paths, run)
-        payload = {
-            "project": state.project.id,
-            "backend": transcript.backend,
-            "model": transcript.model,
-            "language": transcript.language,
-            "words": len(transcript.words),
-            "chunks": len(transcript.chunks),
-            "offset_ms": args.offset_ms,
-            "chunk_ms": args.chunk_ms,
-            "json": str(json_path),
-            "text": str(text_path),
-            "run_id": run.id,
-            "run_status": str(run.status),
-        }
-        lines = [
-            f"transcript: {json_path}",
-            f"text: {text_path}",
-            f"words: {len(transcript.words)}",
-            f"run: {run.id} ({run.status})",
-        ]
-        if paused:
-            lines.append("paused for transcript review; "
-                         "use --no-pause-after-transcript to skip")
-        _emit(args, payload, lines)
-        return 0
-    except Exception as error:
-        _fail_run(state, run, error)
-        raise
+    payload = run_transcribe(
+        state, backend=args.backend, model=args.model,
+        language=args.language, options=parse_options(args.option),
+        offset_ms=args.offset_ms, chunk_ms=args.chunk_ms,
+        pause_after_transcript=args.pause_after_transcript,
+        fallback=fallback,
+    )
+    lines = [
+        f"transcript: {payload['json']}",
+        f"text: {payload['text']}",
+        f"words: {payload['words']}",
+        f"run: {payload['run_id']} ({payload['run_status']})",
+    ]
+    if payload["paused"]:
+        lines.append("paused for transcript review; "
+                     "use --no-pause-after-transcript to skip")
+    _emit(args, payload, lines)
+    return 0
 
 
 def _cmd_reindex(args: argparse.Namespace) -> int:
@@ -528,22 +316,6 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
-def _local_assets(state) -> tuple[list, list]:
-    terms_path = state.paths.assets / "terms.jsonl"
-    tm_path = state.paths.assets / "tm.jsonl"
-    return read_terms(terms_path), read_units(tm_path)
-
-
-def _project_terms_tm(state) -> tuple[list, list]:
-    workspace = find_workspace_for(state.paths.root)
-    if workspace is not None:
-        for subproject in workspace.subprojects:
-            if workspace.subproject_root(subproject) == state.paths.root:
-                return (effective_terms(workspace, subproject),
-                        effective_tm(workspace, subproject))
-    return _local_assets(state)
-
-
 def _cmd_tm(args: argparse.Namespace) -> int:
     state = load_project(args.project)
     path = state.paths.assets / "tm.jsonl"
@@ -657,242 +429,64 @@ def _cmd_corpus(args: argparse.Namespace) -> int:
 
 def _cmd_translate(args: argparse.Namespace) -> int:
     state = load_project(args.project)
-    segments = read_segments(state.paths)
-    if not segments:
-        raise CLIError("missing_segments", "run segment first")
-    terms, tm_units = _project_terms_tm(state)
-    inputs = []
-    selected = segments[:args.limit] if args.limit else segments
-    for index, segment in enumerate(selected):
-        context_before = [item.source for item in
-                          segments[max(0, index - 1):index]]
-        context_after = [item.source for item in
-                         segments[index + 1:index + 2]]
-        inputs.append(SegmentInput(
-            id=segment.id, source=segment.source,
-            context_before=context_before, context_after=context_after,
-            tm_matches=find_matches(segment.source, tm_units),
-            term_hits=match_terms(segment.source, terms),
-        ))
-    backend = get_mt_backend(args.backend or "llama_cpp")
-    options = _parse_options(args.option)
-    if args.base_url:
-        options["base_url"] = args.base_url
-    if args.model:
-        options["model"] = args.model
-    request = MTRequest(
-        source_lang=state.project.source_lang,
-        target_lang=(args.target_lang or
-                     (state.project.target_langs[0]
-                      if state.project.target_langs else "zh-Hans")),
-        segments=inputs,
-        document_brief=args.brief or "",
+    payload = run_translate(
+        state,
+        backend=args.backend or "llama_cpp",
+        base_url=args.base_url,
+        model=args.model or "local",
+        target_lang=args.target_lang,
+        brief=args.brief or "",
         style=args.style or "",
-        options=options,
+        limit=args.limit or 0,
+        options=parse_options(args.option),
     )
-    try:
-        result = backend.translate(request)
-    except Exception as exc:
-        raise CLIError("mt_error", str(exc)) from exc
-    by_id = {segment.id: segment for segment in selected}
-    updated = 0
-    term_hits = 0
-    empty = 0
-    echo = 0
-    for target in result.segments:
-        segment = by_id.get(target.id)
-        if segment is None:
-            continue
-        term_hits += len(match_terms(segment.source, terms))
-        if not target.target.strip():
-            empty += 1
-        if target.target.strip() == segment.source.strip():
-            echo += 1
-        if segment.locked or segment.status == SegmentStatus.APPROVED:
-            continue
-        segment.target = target.target
-        segment.status = SegmentStatus.MT_SUGGESTED
-        segment.revision += 1
-        updated += 1
-    write_segments(state.paths, segments)
-    cues = read_cues(state.paths)
-    updated_ids = {segment.id for segment in selected
-                   if segment.id in by_id
-                   and not segment.locked
-                   and segment.status != SegmentStatus.APPROVED}
-    for cue in cues:
-        if cue.locked:
-            continue
-        segment = by_id.get(cue.segment_id)
-        if segment is None and 0 <= cue.order < len(segments):
-            segment = segments[cue.order]
-        if segment is not None and segment.id in updated_ids:
-            cue.target_text = segment.target
-            cue.revision += 1
-    apply_all(cues)
-    write_cues(state.paths, cues)
-    build_index(state.paths)
-    payload = {
-        "project": state.project.id,
-        "provider": result.provider,
-        "model": result.model,
-        "segments": len(result.segments),
-        "updated": updated,
-        "term_hits": term_hits,
-        "empty": empty,
-        "source_echo": echo,
-        "usage": result.usage.__dict__,
-    }
     _emit(args, payload, [str(payload)])
     return 0
 
 
 def _cmd_segment(args: argparse.Namespace) -> int:
     state = load_project(args.project)
-    existing = read_segments(state.paths)
-    if existing and not args.force:
-        raise CLIError("already_exists",
-                       "segments already exist; pass --force to replace")
-
-    if args.propose:
-        transcript_path = state.paths.asr / "transcript.json"
-        if not transcript_path.is_file():
-            raise CLIError("missing_transcript",
-                           "run transcribe before segment --propose")
-        transcript = load_transcript(transcript_path)
-        segments = segments_from_transcript(transcript, state.project.id)
-    elif args.import_path:
-        path = Path(args.import_path).expanduser()
-        if not path.is_file():
-            raise CLIError("not_found", f"import not found: {path}")
-        if args.target:
-            pairs = load_bilingual_pair(path, args.target)
-        else:
-            lines = read_lines(path)
-            pairs = []
-            for line in lines:
-                if "\t" in line:
-                    source, target = line.split("\t", 1)
-                else:
-                    source, target = line, ""
-                pairs.append((source, target))
-        segments = segments_from_pairs(pairs, state.project.id)
-    else:
-        raise CLIError("invalid_argument",
-                       "segment requires --propose or --import PATH")
-
-    write_segments(state.paths, segments)
-    cues = cues_from_segments(segments)
-    apply_all(cues)
-    write_cues(state.paths, cues)
-    state.project.stage = ProjectStage.DRAFTING
-    save_project(state)
-    payload = {
-        "project": state.project.id,
-        "segments": len(segments),
-        "cues": len(cues),
-    }
+    payload = run_segment(
+        state, propose=args.propose, import_path=args.import_path,
+        target=args.target, force=args.force)
     _emit(args, payload, [
-        f"segments: {len(segments)}",
-        f"cues: {len(cues)}",
+        f"segments: {payload['segments']}",
+        f"cues: {payload['cues']}",
     ])
     return 0
 
 
 def _cmd_align(args: argparse.Namespace) -> int:
     state = load_project(args.project)
-    transcript_path = state.paths.asr / "transcript.json"
-    if not transcript_path.is_file():
-        raise CLIError("missing_transcript",
-                       "run transcribe before align")
-    transcript = load_transcript(transcript_path)
-    if args.offset_ms:
-        apply_offset(transcript, args.offset_ms)
-    cues = read_cues(state.paths)
-    if not cues:
-        segments = read_segments(state.paths)
-        if not segments:
-            raise CLIError("missing_segments",
-                           "run segment before align")
-        cues = cues_from_segments(segments)
-    cues = align_cues_to_words(cues, transcript.words)
-    metrics = apply_all(cues)
-    write_cues(state.paths, cues)
-    state.project.stage = ProjectStage.DRAFTING
-    save_project(state)
-    needs_timing = sum(1 for cue in cues if cue.needs_timing)
-    confidences = [cue.timing_confidence for cue in cues
-                   if cue.timing_confidence is not None]
-    average = sum(confidences) / len(confidences) if confidences else None
-    payload = {
-        "project": state.project.id,
-        "cues": len(cues),
-        "needs_timing": needs_timing,
-        "mean_confidence": None if average is None else round(average, 3),
-        "metrics": metrics,
-    }
+    payload = run_align(state, offset_ms=args.offset_ms)
+    average = payload["mean_confidence"]
     _emit(args, payload, [
-        f"cues: {len(cues)}",
-        f"needs_timing: {needs_timing}",
+        f"cues: {payload['cues']}",
+        f"needs_timing: {payload['needs_timing']}",
         f"mean_confidence: "
         + ("-" if average is None else f"{average:.3f}"),
     ])
     return 0
 
 
-def _slug(value: str) -> str:
-    return "".join(char if char.isalnum() or char in "-_." else "-"
-                   for char in value).strip("-") or "subtitle"
-
-
 def _cmd_style(args: argparse.Namespace) -> int:
     state = load_project(args.project)
-    cues = read_cues(state.paths)
-    if not cues:
-        raise CLIError("missing_cues", "run segment/align first")
-    template = args.template
-    if not template:
-        candidate = state.paths.assets / "template.ass"
-        template = str(candidate) if candidate.is_file() else None
-    output = Path(args.output).expanduser() if args.output else (
-        state.paths.renders / f"{_slug(state.project.name)}.ass")
-    path = export_ass(cues, output, template=template,
-                      bilingual=args.bilingual)
-    payload = {"project": state.project.id, "ass": str(path),
-               "cues": len(cues), "template": template}
-    _emit(args, payload, [f"ass: {path}"])
+    payload = run_style(
+        state, template=args.template, output=args.output,
+        bilingual=args.bilingual)
+    _emit(args, payload, [f"ass: {payload['ass']}"])
     return 0
 
 
 def _cmd_render(args: argparse.Namespace) -> int:
     state = load_project(args.project)
-    cues = read_cues(state.paths)
-    if not cues:
-        raise CLIError("missing_cues", "run segment/align first")
-    if args.ass:
-        ass = Path(args.ass).expanduser()
-        if not ass.is_file():
-            raise CLIError("not_found", f"ASS not found: {ass}")
-    else:
-        ass = state.paths.renders / f"{_slug(state.project.name)}.ass"
-        if not ass.is_file():
-            template = state.paths.assets / "template.ass"
-            export_ass(cues, ass,
-                       template=str(template) if template.is_file() else None,
-                       bilingual=True)
-    source = (state.source.proxy_path or state.source.path
-              if state.source else None)
-    if not source or not Path(source).is_file():
-        raise CLIError("missing_media",
-                       "no proxy/source; run ingest first")
-    output = Path(args.output).expanduser() if args.output else (
-        state.paths.renders /
-        f"{_slug(state.project.name)}-{args.preset}.mp4")
-    render_subtitles(source, ass, output, preset=args.preset,
-                     encoder=args.encoder, crf=args.crf)
-    payload = {"project": state.project.id, "render": str(output),
-               "ass": str(ass), "preset": args.preset}
-    _emit(args, payload, [f"render: {output}", f"ass: {ass}"])
+    payload = run_render(
+        state, ass=args.ass, preset=args.preset, encoder=args.encoder,
+        crf=args.crf, output=args.output)
+    _emit(args, payload, [
+        f"render: {payload['render']}",
+        f"ass: {payload['ass']}",
+    ])
     return 0
 
 
@@ -1000,6 +594,12 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe.add_argument("--language")
     transcribe.add_argument("--option", action="append", metavar="KEY=VALUE",
                             help="backend-specific option (repeatable)")
+    transcribe.add_argument("--fallback-backend", default=None,
+                            help="retry with this backend when primary fails")
+    transcribe.add_argument("--fallback-model", default=None)
+    transcribe.add_argument("--fallback-option", action="append",
+                            metavar="KEY=VALUE",
+                            help="fallback backend option (repeatable)")
     transcribe.add_argument("--offset-ms", type=int, default=0,
                             help="global word timestamp offset")
     transcribe.add_argument("--chunk-ms", type=int, default=0,
@@ -1167,7 +767,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         return int(args.func(args))
-    except CLIError as error:
+    except ActionError as error:
         _emit_error(args, error.code, error.message, error.fields)
         return error.exit_code
     except FileExistsError as error:

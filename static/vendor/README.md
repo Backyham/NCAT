@@ -36,7 +36,7 @@ Tailwind 官方明确说明 Play CDN **仅供开发使用**，它在页面加载
 
 ## 校验
 
-前端脚本在 `static/js/`（无构建，浏览器直接加载 ES Modules）。JS 改完后至少做一次语法检查：
+前端脚本在 `static/js/`（无构建，浏览器直接加载 ES Modules）。JS 改完后至少做一次语法检查；当前 WSL 环境未安装 Node，需先安装 Node 或改用浏览器验证：
 
 ```bash
 node --check static/js/app.js

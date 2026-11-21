@@ -31,7 +31,12 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from ncat import __version__
 from ncat.core import workflow as project_workflow
+from ncat.core.actions import (
+    ActionError, run_align, run_ingest, run_render, run_segment,
+    run_style, run_translate,
+)
 from ncat.core.assets.tm import (
     find_matches, read_tmx, read_units, write_tmx, write_units,
 )
@@ -52,9 +57,11 @@ from ncat.core.project import (
     write_cues, write_segments,
 )
 from ncat.core.runs import list_runs
+from ncat.core.api import api_endpoint, resolve_api_key
+from ncat.core.providers import ProviderError, fetch_models
 from ncat.core.settings import (
-    CLOUD_ASR_URL, CLOUD_MT_URL, LOCAL_ASR_URL, LOCAL_MT_URL,
-    apply_action_defaults, load_settings, public_settings, save_settings,
+    ProviderNotConfigured, apply_action_defaults, load_settings,
+    public_settings, save_settings,
 )
 from ncat.core.segment import segments_from_pairs
 from ncat.core.subs.ass import parse_ass
@@ -68,11 +75,15 @@ from ncat.core.text import normalise_key, source_hash
 from ncat.core.types import (
     Cue, ProjectStage, QAStatus, Segment, SegmentStatus, TMUnit,
 )
+from ncat.core.activity import log_activity, read_activity
 from ncat.core.workspace import (
-    TermbaseRef, TMRef, WorkspaceProject, add_subproject, add_termbase,
-    add_tm, create_workspace, effective_terms, effective_tm, import_termbase,
-    import_tm_pair, load_workspace, read_tm, read_termbase, save_workspace,
-    subproject_state, update_subproject,
+    Attachment, AutomationRule, Comment, ExternalLink, InternalLink,
+    Subtask, TermbaseRef, TMRef, WorkspaceProject, add_category,
+    add_lane, add_subproject, add_termbase, add_tm, category_of,
+    create_workspace, delete_category, delete_lane, delete_subproject,
+    effective_terms, effective_tm, import_termbase, import_tm_pair,
+    lane_of, load_workspace, read_tm, read_termbase, save_workspace,
+    subproject_state, update_category, update_lane, update_subproject,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,7 +91,6 @@ STATIC_DIR = ROOT / "static"
 DEFAULT_PLUGINS = ",".join([
     "parakeet=ncat.test.asr_backend.parakeet:make_backend",
     "canary=ncat.test.asr_backend.canary:make_backend",
-    "nemotron=ncat.test.asr_backend.nemotron:make_backend",
     "qwen3_asr=ncat.test.asr_backend.qwen3_asr:make_backend",
     "openai=ncat.core.asr.openai:make_backend",
 ])
@@ -99,27 +109,20 @@ def _action_python(backend: str | None = None) -> str:
     configured = os.environ.get("NCAT_ASR_PYTHON")
     if configured:
         return configured
-    if backend == "nemotron":
-        candidate = ROOT / ".venv-nemotron" / "bin" / "python"
-        if candidate.is_file():
-            return str(candidate)
     candidate = ROOT / ".venv-asr" / "bin" / "python"
     return str(candidate) if candidate.is_file() else sys.executable
 
 
-def _run_cli(arguments: list[str]) -> dict[str, Any]:
+def _run_asr_worker(arguments: list[str], *,
+                    backend: str | None = None) -> dict[str, Any]:
+    """Run an internal ASR worker in the model virtualenv."""
     env = os.environ.copy()
-    backend = None
-    if arguments and arguments[0] == "transcribe":
-        try:
-            backend = arguments[arguments.index("--backend") + 1]
-        except (ValueError, IndexError):
-            backend = None
     env["NCAT_ASR_PLUGINS"] = (env.get("NCAT_ASR_PLUGINS")
                                or DEFAULT_PLUGINS)
-    command = [_action_python(backend), "-m", "ncat", *arguments]
-    if "--json" not in command:
-        command.append("--json")
+    command = [
+        _action_python(backend), "-m",
+        "ncat.worker.transcribe_project", *arguments,
+    ]
     process = subprocess.run(
         command, cwd=str(ROOT), capture_output=True, text=True, env=env,
     )
@@ -141,6 +144,37 @@ def _run_cli(arguments: list[str]) -> dict[str, Any]:
         return json.loads(output.splitlines()[-1])
     except (json.JSONDecodeError, IndexError):
         return {"output": output}
+
+
+def _transcribe_worker_arguments(project_root: Path, body: dict) -> list[str]:
+    arguments = [str(project_root)]
+    if body.get("backend"):
+        arguments += ["--backend", str(body["backend"])]
+    if body.get("model"):
+        arguments += ["--model", str(body["model"])]
+    if body.get("language"):
+        arguments += ["--language", str(body["language"])]
+    arguments += ["--offset-ms", str(_int_option(body.get("offset_ms"), 0))]
+    arguments += ["--chunk-ms", str(_int_option(body.get("chunk_ms"), 0))]
+    for key, value in (body.get("options") or {}).items():
+        arguments += ["--option", f"{key}={json.dumps(value)}"]
+    fallback = body.get("fallback") or {}
+    if fallback:
+        if fallback.get("backend"):
+            arguments += ["--fallback-backend", str(fallback["backend"])]
+        if fallback.get("model"):
+            arguments += ["--fallback-model", str(fallback["model"])]
+        for key, value in (fallback.get("options") or {}).items():
+            arguments += ["--fallback-option", f"{key}={json.dumps(value)}"]
+    arguments.append("--no-pause-after-transcript")
+    return arguments
+
+
+def _run_transcribe_worker(project_root: Path, body: dict) -> dict[str, Any]:
+    return _run_asr_worker(
+        _transcribe_worker_arguments(project_root, body),
+        backend=body.get("backend"),
+    )
 
 
 def _slug(value: str) -> str:
@@ -222,8 +256,10 @@ def _sub_payload(project: WorkspaceProject, sub, state) -> dict[str, Any]:
             url = _file_url(project, sub, path)
             if url:
                 files[key] = url
+    payload = asdict(sub)
+    payload.pop("workflow", None)
     return {
-        **asdict(sub),
+        **payload,
         "state": {
             "source": asdict(state.source) if state.source else None,
             "asr": state.asr,
@@ -263,12 +299,17 @@ def _project_payload(project: WorkspaceProject) -> dict[str, Any]:
             "legacy": project.legacy,
             "root": str(project.root),
         },
+        "categories": [asdict(item) for item in project.categories],
+        "features": dict(project.features),
+        "automation": [asdict(item) for item in project.automation],
         "subprojects": subs,
         "termbases": [_termbase_payload(project, ref)
                       for ref in project.termbases],
         "tm": [_tm_payload(project, ref) for ref in project.tm],
         "counts": {
             "subprojects": len(subs),
+            "done": sum(1 for item in subs if item.get("done")),
+            "open": sum(1 for item in subs if not item.get("done")),
             "segments": sum(item["counts"]["segments"] for item in subs),
             "cues": sum(item["counts"]["cues"] for item in subs),
         },
@@ -297,7 +338,7 @@ async def _json(request: Request) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- workspace
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"ok": True, "version": "0.1.0"})
+    return JSONResponse({"ok": True, "version": __version__})
 
 
 async def workspace(request: Request) -> JSONResponse:
@@ -343,14 +384,24 @@ async def projects(request: Request) -> JSONResponse:
     if source_path is not None and not source_path.is_file():
         raise HTTPException(400, detail={
             "code": "not_found", "message": f"source not found: {source_path}"})
+    subproject_name = str(body.get("subproject_name") or "")
+    if source_path is not None and not subproject_name:
+        subproject_name = "Main"
+    layout = str(body.get("layout") or "default")
+    if layout not in {"default", "empty"}:
+        raise HTTPException(400, detail={
+            "code": "invalid_argument", "message": "layout must be default or empty"})
+    if source_path is not None:
+        layout = "default"
     project = create_workspace(
         directory, name,
         client=str(body.get("client") or ""),
         source_lang=str(body.get("source_lang") or "en"),
         target_langs=body.get("target_langs") or ["zh-Hans"],
         source_path=source_path,
-        subproject_name=str(body.get("subproject_name") or "Main"),
+        subproject_name=subproject_name,
         kind=str(body.get("kind") or "video"),
+        layout=layout,
     )
     return JSONResponse(_project_payload(project), status_code=201)
 
@@ -358,6 +409,11 @@ async def projects(request: Request) -> JSONResponse:
 async def project_detail(request: Request) -> JSONResponse:
     root = workspace_root(request.app.state.workspace)
     project = _find_workspace(root, request.path_params["project_id"])
+    if request.method == "PATCH":
+        body = await _json(request)
+        if body.get("name") is not None:
+            project.name = str(body["name"]).strip() or project.name
+            save_workspace(project)
     return JSONResponse(_project_payload(project))
 
 
@@ -376,13 +432,26 @@ async def subprojects(request: Request) -> JSONResponse:
     if source_path is not None and not source_path.is_file():
         raise HTTPException(400, detail={
             "code": "not_found", "message": f"source not found: {source_path}"})
-    sub = add_subproject(
-        project, str(body.get("name") or "Subproject"),
-        kind=str(body.get("kind") or "video"),
-        source_path=source_path,
-        source_lang=body.get("source_lang"),
-        target_langs=body.get("target_langs"),
-    )
+    try:
+        sub = add_subproject(
+            project, str(body.get("name") or "新项目"),
+            kind=str(body.get("kind") or "video"),
+            source_path=source_path,
+            source_lang=body.get("source_lang"),
+            target_langs=body.get("target_langs"),
+            category_id=str(body.get("category_id") or ""),
+            lane_id=str(body.get("lane_id") or ""),
+        )
+    except ValueError as error:
+        raise HTTPException(400, detail={
+            "code": "layout_required" if str(error) == "layout_required"
+            else "invalid_argument",
+            "message": "请先在看板设置中创建分类和泳道"
+            if str(error) == "layout_required" else str(error),
+        }) from error
+    log_activity(project, "subproject_added", subproject_id=sub.id,
+                 name=sub.name, category_id=sub.category_id,
+                 lane_id=sub.lane_id)
     state = subproject_state(project, sub)
     return JSONResponse(_sub_payload(project, sub, state), status_code=201)
 
@@ -390,105 +459,557 @@ async def subprojects(request: Request) -> JSONResponse:
 async def subproject_detail(request: Request) -> JSONResponse:
     root = workspace_root(request.app.state.workspace)
     project = _find_workspace(root, request.path_params["project_id"])
-    sub = project.subproject(request.path_params["subproject_id"])
+    subproject_id = request.path_params["subproject_id"]
+    if request.method == "DELETE":
+        try:
+            deleted = delete_subproject(project, subproject_id)
+        except FileNotFoundError as error:
+            raise HTTPException(404, detail={
+                "code": "not_found", "message": str(error)}) from error
+        except ValueError as error:
+            raise HTTPException(400, detail={
+                "code": "invalid_argument", "message": str(error)}) from error
+        for remaining in project.subprojects:
+            remaining.internal_links = [
+                link for link in remaining.internal_links
+                if link.target_subproject_id != deleted.id
+            ]
+        save_workspace(project)
+        log_activity(project, "subproject_deleted", subproject_id=deleted.id,
+                     name=deleted.name, category_id=deleted.category_id,
+                     lane_id=deleted.lane_id)
+        return JSONResponse({"ok": True, "deleted": deleted.id})
+    sub = project.subproject(subproject_id)
     if request.method == "PATCH":
         body = await _json(request)
-        sub = update_subproject(
-            project, sub.id,
-            **{key: body[key] for key in
-               ("name", "kind", "termbase_ids", "tm_ids") if key in body})
+        previous = (sub.category_id, sub.lane_id)
+        try:
+            sub = update_subproject(
+                project, sub.id,
+                **{key: body[key] for key in
+                   ("name", "description", "category_id", "lane_id", "due",
+                    "done") if key in body})
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(400, detail={
+                "code": "invalid_argument", "message": str(error)}) from error
+        if previous != (sub.category_id, sub.lane_id):
+            log_activity(project, "subproject_moved", subproject_id=sub.id,
+                         name=sub.name, from_category_id=previous[0],
+                         from_lane_id=previous[1],
+                         to_category_id=sub.category_id,
+                         to_lane_id=sub.lane_id,
+                         category_id=sub.category_id, lane_id=sub.lane_id)
     state = subproject_state(project, sub)
     return JSONResponse(_sub_payload(project, sub, state))
 
 
+async def board_project_view(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    return JSONResponse(await asyncio.to_thread(project_workflow.board, project))
+
+
+async def project_overview(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    board = await asyncio.to_thread(project_workflow.board, project)
+    today = now_iso()[:10]
+    categories = []
+    total = done_count = overdue = 0
+    for category in board["categories"]:
+        lanes = []
+        category_total = category_done = 0
+        for lane in category["lanes"]:
+            lane_total = len(lane["cards"])
+            lane_done = sum(1 for card in lane["cards"] if card["done"])
+            lane_overdue = sum(
+                1 for card in lane["cards"]
+                if not card["done"] and card.get("due")
+                and str(card["due"]) < today)
+            total += lane_total
+            done_count += lane_done
+            overdue += lane_overdue
+            category_total += lane_total
+            category_done += lane_done
+            lanes.append({
+                "id": lane["id"], "name": lane["name"],
+                "total": lane_total, "done": lane_done,
+                "overdue": lane_overdue,
+            })
+        categories.append({
+            "id": category["id"], "name": category["name"],
+            "total": category_total, "done": category_done,
+            "lanes": lanes,
+        })
+    return JSONResponse({
+        "project": {
+            "id": project.id, "name": project.name,
+            "features": dict(project.features),
+        },
+        "totals": {
+            "subprojects": total, "done": done_count,
+            "open": total - done_count, "overdue": overdue,
+        },
+        "categories": categories,
+        "activity": read_activity(project, limit=50),
+    })
+
+
+async def project_activity(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    try:
+        limit = int(request.query_params.get("limit") or 50)
+    except ValueError:
+        limit = 50
+    return JSONResponse({"events": read_activity(project, limit=limit)})
+
+
+async def categories_view(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    body = await _json(request)
+    category = add_category(project, str(body.get("name") or "新分类"))
+    save_workspace(project)
+    log_activity(project, "category_added", category_id=category.id,
+                 name=category.name)
+    return JSONResponse(asdict(category), status_code=201)
+
+
+async def category_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    category_id = request.path_params["category_id"]
+    if request.method == "DELETE":
+        try:
+            category = delete_category(project, category_id)
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(400, detail={
+                "code": "invalid_argument", "message": str(error)}) from error
+        log_activity(project, "category_deleted", category_id=category.id,
+                     name=category.name)
+        return JSONResponse({"ok": True})
+    body = await _json(request)
+    try:
+        category = update_category(
+            project, category_id,
+            name=body.get("name"), order=body.get("order"))
+    except (FileNotFoundError, ValueError) as error:
+        raise HTTPException(400, detail={
+            "code": "invalid_argument", "message": str(error)}) from error
+    return JSONResponse(asdict(category))
+
+
+async def lanes_view(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    category = category_of(project, request.path_params["category_id"])
+    body = await _json(request)
+    lane = add_lane(project, category, str(body.get("name") or "新泳道"))
+    save_workspace(project)
+    log_activity(project, "lane_added", category_id=category.id,
+                 lane_id=lane.id, name=lane.name)
+    return JSONResponse(asdict(lane), status_code=201)
+
+
+async def lane_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    category_id = request.path_params["category_id"]
+    lane_id = request.path_params["lane_id"]
+    if request.method == "DELETE":
+        try:
+            lane = delete_lane(project, category_id, lane_id)
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(400, detail={
+                "code": "invalid_argument", "message": str(error)}) from error
+        log_activity(project, "lane_deleted", category_id=category_id,
+                     lane_id=lane.id, name=lane.name)
+        return JSONResponse({"ok": True})
+    body = await _json(request)
+    try:
+        lane = update_lane(
+            project, category_id, lane_id,
+            name=body.get("name"), order=body.get("order"))
+    except (FileNotFoundError, ValueError) as error:
+        raise HTTPException(400, detail={
+            "code": "invalid_argument", "message": str(error)}) from error
+    return JSONResponse(asdict(lane))
+
+
+async def project_features(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    body = await _json(request)
+    for key in project.features:
+        if key in body:
+            project.features[key] = bool(body[key])
+    save_workspace(project)
+    return JSONResponse({"features": dict(project.features)})
+
+
+async def project_automation(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    if request.method == "GET":
+        return JSONResponse({"rules": [asdict(item) for item in project.automation]})
+    body = await _json(request)
+    title = str(body.get("subtask_title") or "").strip()
+    category_id = str(body.get("target_category_id") or "")
+    lane_id = str(body.get("target_lane_id") or "")
+    if not title or not category_id or not lane_id:
+        raise HTTPException(400, detail={
+            "code": "invalid_argument", "message": "subtask title and target lane are required"})
+    category = category_of(project, category_id)
+    lane_of(project, category, lane_id)
+    rule = AutomationRule(
+        id=new_id("rule"), subtask_title=title,
+        target_category_id=category_id, target_lane_id=lane_id,
+        category_scope_id=body.get("category_scope_id") or None,
+        enabled=bool(body.get("enabled", True)),
+        order=len(project.automation),
+    )
+    project.automation.append(rule)
+    save_workspace(project)
+    return JSONResponse(asdict(rule), status_code=201)
+
+
+async def automation_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    rule = next((item for item in project.automation
+                 if item.id == request.path_params["rule_id"]), None)
+    if rule is None:
+        raise HTTPException(404, detail={"code": "not_found",
+                                         "message": "rule not found"})
+    if request.method == "DELETE":
+        project.automation = [item for item in project.automation
+                              if item.id != rule.id]
+        save_workspace(project)
+        return JSONResponse({"ok": True})
+    body = await _json(request)
+    if body.get("subtask_title") is not None:
+        rule.subtask_title = str(body["subtask_title"]).strip()
+    if body.get("target_category_id") is not None:
+        rule.target_category_id = str(body["target_category_id"])
+    if body.get("target_lane_id") is not None:
+        rule.target_lane_id = str(body["target_lane_id"])
+    if "enabled" in body:
+        rule.enabled = bool(body["enabled"])
+    if "category_scope_id" in body:
+        rule.category_scope_id = body["category_scope_id"] or None
+    save_workspace(project)
+    return JSONResponse(asdict(rule))
+
+
+async def subproject_subtasks(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = next((item for item in project.subprojects
+                if item.id == request.path_params["subproject_id"]), None)
+    if sub is None:
+        raise HTTPException(404, detail={"code": "not_found",
+                                         "message": "subproject not found"})
+    body = await _json(request)
+    title = str(body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, detail={"code": "invalid_argument",
+                                         "message": "title required"})
+    task = Subtask(id=new_id("task"), title=title, order=len(sub.subtasks),
+                   created_at=now_iso())
+    sub.subtasks.append(task)
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    log_activity(project, "subtask_added", subproject_id=sub.id,
+                 name=sub.name, subtask_id=task.id, title=title,
+                 category_id=sub.category_id, lane_id=sub.lane_id)
+    return JSONResponse(asdict(task), status_code=201)
+
+
+async def subtask_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = next((item for item in project.subprojects
+                if item.id == request.path_params["subproject_id"]), None)
+    if sub is None:
+        raise HTTPException(404, detail={"code": "not_found",
+                                         "message": "subproject not found"})
+    task = next((item for item in sub.subtasks
+                 if item.id == request.path_params["task_id"]), None)
+    if task is None:
+        raise HTTPException(404, detail={"code": "not_found",
+                                         "message": "subtask not found"})
+    if request.method == "DELETE":
+        sub.subtasks = [item for item in sub.subtasks if item.id != task.id]
+        sub.updated_at = now_iso()
+        save_workspace(project)
+        log_activity(project, "subtask_deleted", subproject_id=sub.id,
+                     name=sub.name, subtask_id=task.id, title=task.title,
+                     category_id=sub.category_id, lane_id=sub.lane_id)
+        return JSONResponse({"ok": True})
+    body = await _json(request)
+    if body.get("title") is not None:
+        task.title = str(body["title"]).strip() or task.title
+    if "order" in body:
+        task.order = int(body["order"])
+    if "done" in body:
+        done = bool(body["done"])
+        changed = done != task.done
+        task.done = done
+        task.completed_at = now_iso() if done else None
+        if changed:
+            log_activity(
+                project,
+                "subtask_completed" if done else "subtask_uncompleted",
+                subproject_id=sub.id, name=sub.name, subtask_id=task.id,
+                title=task.title, category_id=sub.category_id,
+                lane_id=sub.lane_id,
+            )
+            if done:
+                project_workflow.apply_subtask_automation(
+                    project, sub, task.title)
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    state = subproject_state(project, sub)
+    return JSONResponse(_sub_payload(project, sub, state))
+
+
+def _subproject_for(project: WorkspaceProject, subproject_id: str):
+    sub = next((item for item in project.subprojects
+                if item.id == subproject_id), None)
+    if sub is None:
+        raise HTTPException(404, detail={"code": "not_found",
+                                         "message": "subproject not found"})
+    return sub
+
+
+async def internal_links(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    body = await _json(request)
+    target = str(body.get("target_subproject_id") or "")
+    if target == sub.id or not any(item.id == target for item in project.subprojects):
+        raise HTTPException(400, detail={"code": "invalid_argument",
+                                         "message": "invalid target subproject"})
+    link = InternalLink(id=new_id("link"), target_subproject_id=target,
+                        label=str(body.get("label") or ""))
+    sub.internal_links.append(link)
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    return JSONResponse(asdict(link), status_code=201)
+
+
+async def internal_link_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    link_id = request.path_params["link_id"]
+    sub.internal_links = [item for item in sub.internal_links
+                          if item.id != link_id]
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    return JSONResponse({"ok": True})
+
+
+async def external_links(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    body = await _json(request)
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, detail={"code": "invalid_argument",
+                                         "message": "url required"})
+    link = ExternalLink(id=new_id("link"), label=str(body.get("label") or ""),
+                        url=url)
+    sub.external_links.append(link)
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    return JSONResponse(asdict(link), status_code=201)
+
+
+async def external_link_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    sub.external_links = [item for item in sub.external_links
+                          if item.id != request.path_params["link_id"]]
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    return JSONResponse({"ok": True})
+
+
+async def subproject_comments(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    body = await _json(request)
+    text = str(body.get("body") or "").strip()
+    if not text:
+        raise HTTPException(400, detail={"code": "invalid_argument",
+                                         "message": "comment body required"})
+    comment = Comment(id=new_id("cmt"), body=text, created_at=now_iso())
+    sub.comments.append(comment)
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    return JSONResponse(asdict(comment), status_code=201)
+
+
+async def comment_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    sub.comments = [item for item in sub.comments
+                    if item.id != request.path_params["comment_id"]]
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    return JSONResponse({"ok": True})
+
+
+async def subproject_attachments(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    if request.method == "GET":
+        return JSONResponse({"attachments": [asdict(item) for item in sub.attachments]})
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None:
+        raise HTTPException(400, detail={"code": "invalid_argument",
+                                         "message": "file required"})
+    directory = project.subproject_root(sub) / "attachments"
+    directory.mkdir(parents=True, exist_ok=True)
+    attachment_id = new_id("att")
+    safe_name = Path(getattr(upload, "filename", "attachment")).name or "attachment"
+    target = directory / f"{attachment_id}-{safe_name}"
+    with target.open("wb") as handle:
+        while chunk := await upload.read(1024 * 1024):
+            handle.write(chunk)
+    attachment = Attachment(
+        id=attachment_id, name=safe_name, size=target.stat().st_size,
+        content_type=getattr(upload, "content_type", "") or "",
+        created_at=now_iso(),
+        path=str(target.relative_to(project.root)),
+    )
+    sub.attachments.append(attachment)
+    sub.updated_at = now_iso()
+    save_workspace(project)
+    return JSONResponse(asdict(attachment), status_code=201)
+
+
+async def attachment_detail(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    project = _find_workspace(root, request.path_params["project_id"])
+    sub = _subproject_for(project, request.path_params["subproject_id"])
+    attachment = next((item for item in sub.attachments
+                       if item.id == request.path_params["attachment_id"]), None)
+    if attachment is None:
+        raise HTTPException(404, detail={"code": "not_found",
+                                         "message": "attachment not found"})
+    if request.method == "DELETE":
+        try:
+            (project.root / attachment.path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        sub.attachments = [item for item in sub.attachments
+                           if item.id != attachment.id]
+        sub.updated_at = now_iso()
+        save_workspace(project)
+        return JSONResponse({"ok": True})
+    return FileResponse(project.root / attachment.path,
+                        filename=attachment.name,
+                        media_type=attachment.content_type or None)
+
+
 # ------------------------------------------------------------------- actions
-def _action_args(action: str, directory: Path, body: dict) -> list[str]:
+CORE_ACTIONS = frozenset({
+    "ingest", "segment", "align", "translate", "style", "render",
+})
+
+
+def _int_option(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _run_core_action(action: str, state, project, body: dict) -> dict:
     if action == "ingest":
-        args = ["ingest", str(directory)]
-        args += ["--height", str(body.get("height", 720))]
-        if body.get("encoder"):
-            args += ["--encoder", str(body["encoder"])]
-        if body.get("force"):
-            args.append("--force")
-        return args
-    if action == "transcribe":
-        args = ["transcribe", str(directory)]
-        if body.get("backend"):
-            args += ["--backend", str(body["backend"])]
-        if body.get("model"):
-            args += ["--model", str(body["model"])]
-        if body.get("language"):
-            args += ["--language", str(body["language"])]
-        if body.get("offset_ms"):
-            args += ["--offset-ms", str(int(body["offset_ms"]))]
-        if body.get("chunk_ms") is not None:
-            args += ["--chunk-ms", str(int(body["chunk_ms"]))]
-        for key, value in (body.get("options") or {}).items():
-            args += ["--option", f"{key}={json.dumps(value)}"]
-        args.append("--no-pause-after-transcript")
-        return args
+        return run_ingest(
+            state, height=_int_option(body.get("height"), 720),
+            encoder=body.get("encoder") or None,
+            force=bool(body.get("force")))
     if action == "segment":
-        args = ["segment", str(directory)]
-        if body.get("propose", True):
-            args.append("--propose")
-        elif body.get("import_path"):
-            args += ["--import", str(body["import_path"])]
-            if body.get("target"):
-                args += ["--target", str(body["target"])]
-        if body.get("force"):
-            args.append("--force")
-        return args
+        return run_segment(
+            state, propose=bool(body.get("propose", True)),
+            import_path=body.get("import_path"),
+            target=body.get("target"), force=bool(body.get("force")))
     if action == "align":
-        args = ["align", str(directory)]
-        if body.get("offset_ms"):
-            args += ["--offset-ms", str(int(body["offset_ms"]))]
-        return args
+        return run_align(
+            state, offset_ms=_int_option(body.get("offset_ms"), 0))
     if action == "translate":
-        args = ["translate", str(directory)]
-        if body.get("backend"):
-            args += ["--backend", str(body["backend"])]
-        if body.get("base_url"):
-            args += ["--base-url", str(body["base_url"])]
-        if body.get("model"):
-            args += ["--model", str(body["model"])]
-        if body.get("target_lang"):
-            args += ["--target-lang", str(body["target_lang"])]
-        if body.get("brief"):
-            args += ["--brief", str(body["brief"])]
-        if body.get("style"):
-            args += ["--style", str(body["style"])]
-        if body.get("limit"):
-            args += ["--limit", str(int(body["limit"]))]
-        for key, value in (body.get("options") or {}).items():
-            args += ["--option", f"{key}={json.dumps(value)}"]
-        return args
+        return run_translate(
+            state, backend=body.get("backend") or "llama_cpp",
+            base_url=body.get("base_url"),
+            model=body.get("model") or "local",
+            target_lang=body.get("target_lang"),
+            brief=body.get("brief") or "", style=body.get("style") or "",
+            genre=body.get("genre") or "字幕",
+            limit=_int_option(body.get("limit"), 0),
+            options=body.get("options") or {},
+            fallback=body.get("fallback"))
     if action == "style":
-        args = ["style", str(directory)]
-        if body.get("template"):
-            args += ["--template", str(body["template"])]
-        if body.get("bilingual") is False:
-            args.append("--no-bilingual")
-        return args
+        return run_style(
+            state, template=body.get("template"), output=body.get("output"),
+            bilingual=body.get("bilingual") is not False)
     if action == "render":
-        args = ["render", str(directory)]
-        if body.get("ass"):
-            args += ["--ass", str(body["ass"])]
-        if body.get("preset"):
-            args += ["--preset", str(body["preset"])]
-        if body.get("encoder"):
-            args += ["--encoder", str(body["encoder"])]
-        if body.get("crf"):
-            args += ["--crf", str(int(body["crf"]))]
-        return args
-    raise HTTPException(404, detail={
-        "code": "not_found", "message": f"unknown action: {action}"})
+        return run_render(
+            state, ass=body.get("ass"),
+            preset=body.get("preset") or "original",
+            encoder=body.get("encoder") or "libx264",
+            crf=_int_option(body.get("crf"), 20),
+            output=body.get("output"))
+    raise ActionError("not_found", f"unknown action: {action}")
+
+
+ACTION_FEATURES = {
+    "ingest": "ffmpeg",
+    "transcribe": "asr",
+    "segment": "segment",
+    "align": "timing",
+    "translate": "mt",
+    "style": "subtitle_edit",
+    "render": "export",
+}
 
 
 async def _run_action(project, sub, body: dict, action: str) -> JSONResponse:
+    required = ACTION_FEATURES.get(action)
+    if required and not project.features.get(required, True):
+        raise HTTPException(400, detail={
+            "code": "feature_disabled",
+            "message": f"feature disabled: {required}",
+        })
     state = subproject_state(project, sub)
-    args = _action_args(action, state.paths.root, body)
     history_push(state.paths)
-    result = await asyncio.to_thread(_run_cli, args)
+    try:
+        if action == "transcribe":
+            result = await asyncio.to_thread(
+                _run_transcribe_worker, state.paths.root, body)
+        elif action in CORE_ACTIONS:
+            result = await asyncio.to_thread(
+                _run_core_action, action, state, project, body)
+        else:
+            raise HTTPException(404, detail={
+                "code": "not_found",
+                "message": f"unknown action: {action}"})
+    except ActionError as error:
+        detail = {"code": error.code, "message": error.message}
+        if error.fields:
+            detail["fields"] = error.fields
+        raise HTTPException(400, detail=detail) from error
     build_index(state.paths)
     return JSONResponse(result)
 
@@ -500,7 +1021,12 @@ async def project_actions(request: Request) -> JSONResponse:
     body = await _json(request) if request.method == "POST" else {}
     action = request.path_params["action"]
     if action in {"transcribe", "translate"}:
-        body = apply_action_defaults(root, action, body)
+        try:
+            body = apply_action_defaults(root, action, body)
+        except ProviderNotConfigured as error:
+            raise HTTPException(400, detail={
+                "code": "provider_not_configured",
+                "message": str(error)}) from error
     return await _run_action(project, sub, body, action)
 
 
@@ -511,7 +1037,12 @@ async def subproject_actions(request: Request) -> JSONResponse:
     body = await _json(request) if request.method == "POST" else {}
     action = request.path_params["action"]
     if action in {"transcribe", "translate"}:
-        body = apply_action_defaults(root, action, body)
+        try:
+            body = apply_action_defaults(root, action, body)
+        except ProviderNotConfigured as error:
+            raise HTTPException(400, detail={
+                "code": "provider_not_configured",
+                "message": str(error)}) from error
     return await _run_action(project, sub, body, action)
 
 
@@ -1199,7 +1730,7 @@ def _run_job(job: TranscribeJob, out: Path) -> None:
     job.stage = "loading_backend"
     job.started_at = now_iso()
     command = [
-        _action_python(job.backend), "-m", "ncat.test.transcribe_worker",
+        _action_python(job.backend), "-m", "ncat.worker.transcribe_audio",
         "--audio", job.audio_path, "--backend", job.backend,
         "--out", str(out),
     ]
@@ -1409,8 +1940,6 @@ def _system_payload() -> dict:
                 backend = ""
                 if model_type == "qwen3_asr":
                     backend = "qwen3_asr"
-                elif model_type == "nemo_speechlm":
-                    backend = "nemotron"
                 elif model_type == "qwen3_5" or model_type == "qwen3_5_moe":
                     backend = "mt"
                 if backend:
@@ -1431,7 +1960,7 @@ async def system_info(request: Request) -> JSONResponse:
 
 async def transcribe_backends(request: Request) -> JSONResponse:
     payload = await asyncio.to_thread(
-        _run_cli, ["transcribe", "--list-backends"])
+        _run_asr_worker, ["--list-backends"])
     return JSONResponse(payload)
 
 
@@ -1556,14 +2085,15 @@ async def _suggest(project, sub, request: Request) -> JSONResponse:
 
 
 def _mt_options(root: Path) -> tuple[str, str, dict]:
-    """Resolve backend name, model id and options from server settings."""
-    settings = load_settings(root)
-    if settings["mt"].get("mode") == "cloud":
-        return ("openai_compatible", os.environ.get(CLOUD_MT_MODEL, ""),
-                {"base_url": os.environ.get(CLOUD_MT_URL, "")})
-    model = os.environ.get("NCAT_MT_LOCAL_MODEL", "") or "local"
-    base = os.environ.get(LOCAL_MT_URL, "http://127.0.0.1:8080")
-    return "llama_cpp", model, {"base_url": base}
+    """Resolve backend, model and options from the configured MT provider."""
+    routed = apply_action_defaults(root, "translate", {})
+    backend = str(routed.get("backend") or "")
+    model = str(routed.get("model") or "")
+    options = dict(routed.get("options") or {})
+    if routed.get("base_url"):
+        options["base_url"] = routed["base_url"]
+    options["model"] = model
+    return backend, model, options
 
 
 async def subproject_cue_mt(request: Request) -> JSONResponse:
@@ -1585,7 +2115,12 @@ async def subproject_cue_mt(request: Request) -> JSONResponse:
     if not source.strip():
         raise HTTPException(400, detail={
             "code": "empty_source", "message": "cue has no source text"})
-    backend_name, model, options = _mt_options(root)
+    try:
+        backend_name, _model, options = _mt_options(root)
+    except ProviderNotConfigured as error:
+        raise HTTPException(400, detail={
+            "code": "provider_not_configured",
+            "message": str(error)}) from error
     terms = _qa_terms(project, sub, state)
     units = list(effective_tm(project, sub)) + _local_tm_units(state)
     matches = [
@@ -1595,19 +2130,23 @@ async def subproject_cue_mt(request: Request) -> JSONResponse:
         for hit in find_matches(source, units, limit=3)
     ]
     hits = match_terms(source, terms, confirmed_only=False)
-    request_payload = MTRequest(
-        source_lang=state.project.source_lang,
-        target_lang=(state.project.target_langs or ["zh-Hans"])[0],
-        segments=[SegmentInput(id=cue.id, source=source,
-                               tm_matches=matches, term_hits=hits)],
-        options=options,
-    )
+    segments = [SegmentInput(id=cue.id, source=source,
+                              tm_matches=matches, term_hits=hits)]
+
+    def build_request(request_options: dict) -> MTRequest:
+        return MTRequest(
+            source_lang=state.project.source_lang,
+            target_lang=(state.project.target_langs or ["zh-Hans"])[0],
+            segments=segments,
+            options=request_options,
+        )
+
     try:
         result = await asyncio.to_thread(
-            get_backend(backend_name).translate, request_payload)
-    except Exception as exc:
+            get_backend(backend_name).translate, build_request(options))
+    except Exception as error:
         raise HTTPException(502, detail={
-            "code": "mt_failed", "message": str(exc)[:300]})
+            "code": "mt_failed", "message": str(error)[:300]}) from error
     target = result.segments[0].target if result.segments else ""
     _audit(state, "mt_suggestion", cue_id=cue.id, model=result.model,
            provider=result.provider)
@@ -1681,81 +2220,41 @@ async def board_view(request: Request) -> JSONResponse:
     project_id = request.query_params.get("project_id") or None
 
     def build():
+        categories: list[dict] = []
         cards: list[dict] = []
-        columns = None
         for project in _projects_for_board(root, project_id):
             data = project_workflow.board(project)
-            columns = columns or data["columns"]
-            cards.extend(data["cards"])
+            for category in data["categories"]:
+                category = {**category, "project_id": project.id,
+                            "project_name": project.name}
+                categories.append(category)
+                for lane in category["lanes"]:
+                    cards.extend(lane["cards"])
         return {
             "generated_at": now_iso(),
-            "columns": columns or [
-                {"key": key, "label": label}
-                for key, label in project_workflow.STAGES
-            ],
+            "categories": categories,
             "cards": cards,
         }
 
     return JSONResponse(await asyncio.to_thread(build))
 
 
-def _validate_stage(stage, derived: str, reason: str) -> str | None:
-    if stage in (None, ""):
-        return None
-    if stage not in project_workflow.STAGE_KEYS:
-        raise HTTPException(400, detail={
-            "code": "invalid_stage", "message": f"unknown stage: {stage}"})
-    order = {key: index for index, key in
-             enumerate(project_workflow.STAGE_KEYS)}
-    if order[stage] < order[derived] and not reason:
-        raise HTTPException(400, detail={
-            "code": "reason_required",
-            "message": "向回移动需要填写原因"})
-    return stage
-
-
 async def subproject_workflow_view(request: Request) -> JSONResponse:
     root = workspace_root(request.app.state.workspace)
     project = _find_workspace(root, request.path_params["project_id"])
     sub = project.subproject(request.path_params["subproject_id"])
-    state = subproject_state(project, sub)
     if request.method == "GET":
-        return JSONResponse(project_workflow.card(project, sub, state))
+        return JSONResponse(project_workflow.card(project, sub))
     body = await _json(request)
-    current = project_workflow.workflow_of(sub)
-    if body.get("revision") is not None:
-        try:
-            revision = int(body["revision"])
-        except (TypeError, ValueError):
-            raise HTTPException(400, detail={
-                "code": "invalid_revision", "message": "revision must be int"})
-        if revision != int(current.get("revision") or 0):
-            raise HTTPException(409, detail={
-                "code": "revision_conflict",
-                "message": "workflow was changed elsewhere; reload the board",
-                "revision": current.get("revision") or 0})
-    changes = {}
-    for key in ("stage_override", "archived", "due", "priority", "labels",
-                "blocked", "owner", "waiting_on"):
-        if key in body:
-            changes[key] = body[key]
-    derived = project_workflow.derive(project, sub, state)["stage"]
-    reason = str(body.get("reason") or "")
-    if "stage_override" in changes:
-        changes["stage_override"] = _validate_stage(
-            changes["stage_override"], derived, reason)
-        if changes["stage_override"] == "archived":
-            changes["stage_override"] = None
-            changes["archived"] = True
-        elif changes["stage_override"] and changes.get("archived") is None:
-            changes["archived"] = False
-    result = await asyncio.to_thread(
-        project_workflow.apply_change, project, sub, changes, reason=reason)
-    _audit(state, "stage_override",
-           stage=changes.get("stage_override") or derived,
-           archived=bool(result["workflow"].get("archived")), reason=reason,
-           revision=result["workflow"]["revision"])
-    return JSONResponse(project_workflow.card(project, sub, state))
+    category_id = str(body.get("category_id") or sub.category_id)
+    lane_id = str(body.get("lane_id") or sub.lane_id)
+    try:
+        card = await asyncio.to_thread(
+            project_workflow.move_card, project, sub, category_id, lane_id)
+    except (FileNotFoundError, ValueError) as error:
+        raise HTTPException(400, detail={
+            "code": "invalid_argument", "message": str(error)}) from error
+    return JSONResponse(card)
 
 
 async def board_move(request: Request) -> JSONResponse:
@@ -1770,23 +2269,20 @@ async def board_move(request: Request) -> JSONResponse:
         if not isinstance(move, dict):
             continue
         project = _find_workspace(root, str(move.get("project_id") or ""))
-        sub = project.subproject(str(move.get("subproject_id") or ""))
-        state = subproject_state(project, sub)
-        derived = project_workflow.derive(project, sub, state)["stage"]
-        reason = str(move.get("reason") or "")
-        stage = _validate_stage(move.get("stage"), derived, reason)
-        changes = {"stage_override": stage}
-        if stage == "archived":
-            changes["stage_override"] = None
-            changes["archived"] = True
-        else:
-            changes["archived"] = False
-        result = await asyncio.to_thread(
-            project_workflow.apply_change, project, sub, changes,
-            reason=reason)
-        _audit(state, "stage_override", stage=stage or derived,
-               reason=reason, revision=result["workflow"]["revision"])
-        cards.append(project_workflow.card(project, sub, state))
+        sub = next((item for item in project.subprojects
+                    if item.id == str(move.get("subproject_id") or "")), None)
+        if sub is None:
+            raise HTTPException(404, detail={
+                "code": "not_found", "message": "subproject not found"})
+        try:
+            card = await asyncio.to_thread(
+                project_workflow.move_card, project, sub,
+                str(move.get("category_id") or ""),
+                str(move.get("lane_id") or ""))
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(400, detail={
+                "code": "invalid_argument", "message": str(error)}) from error
+        cards.append(card)
     return JSONResponse({"cards": cards})
 
 
@@ -1919,8 +2415,49 @@ async def settings_view(request: Request) -> JSONResponse:
     if request.method == "GET":
         return JSONResponse(public_settings(root))
     body = await _json(request)
-    save_settings(root, body)
+    try:
+        save_settings(root, body)
+    except ValueError as error:
+        raise HTTPException(400, detail={
+            "code": "invalid_argument", "message": str(error)}) from error
     return JSONResponse(public_settings(root))
+
+
+async def provider_models(request: Request) -> JSONResponse:
+    root = workspace_root(request.app.state.workspace)
+    body = await _json(request)
+    service = str(body.get("service") or "")
+    if service not in {"asr", "mt"}:
+        raise HTTPException(400, detail={
+            "code": "invalid_argument", "message": "service must be asr or mt"})
+    settings = load_settings(root)
+    provider_id = str(body.get("id") or body.get("provider_id") or "")
+    provider = next((item for item in settings["providers"]
+                     if item["id"] == provider_id), None)
+    base_url = str(body.get("base_url")
+                   or (provider or {}).get("base_url") or "")
+    default_type = "openai_audio" if service == "asr" else "openai_chat"
+    api_type = str(body.get("api_type")
+                   or (provider or {}).get("api_type") or default_type)
+    api_key = str(body.get("api_key")
+                  or (provider or {}).get("api_key") or "")
+    api_key = api_key.strip() or resolve_api_key(None, provider=service)
+    headers = (body.get("headers") if isinstance(body.get("headers"), dict)
+               else (provider or {}).get("headers") or {})
+    try:
+        models = await asyncio.to_thread(
+            fetch_models, base_url, api_type,
+            api_key=api_key, headers=headers,
+        )
+    except ProviderError as error:
+        raise HTTPException(400, detail={
+            "code": error.code, "message": str(error)}) from error
+    return JSONResponse({
+        "service": service,
+        "base_url": base_url,
+        "api_type": api_type,
+        "models": models,
+    })
 
 
 def _parse_models_payload(payload: dict) -> dict:
@@ -1955,17 +2492,30 @@ def _parse_models_payload(payload: dict) -> dict:
     }
 
 
-def _service_models(url: str) -> dict:
+def _health_request(url: str) -> "urllib.request.Request":
+    import urllib.request
+    return urllib.request.Request(
+        url, headers={"User-Agent": f"NCAT/{__version__}"})
+
+
+def _service_root(url: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+def _service_models(url: str) -> dict | None:
     if not url:
-        return {"loaded": [], "available": [], "count": 0}
+        return None
     try:
         import json as _json
         import urllib.request
-        with urllib.request.urlopen(url.rstrip("/") + "/v1/models",
-                                    timeout=1.5) as response:
+        with urllib.request.urlopen(
+                _health_request(api_endpoint(url, "/models")),
+                timeout=1.5) as response:
             payload = _json.loads(response.read().decode("utf-8", "replace"))
     except Exception:
-        return {"loaded": [], "available": [], "count": 0}
+        return None
     return _parse_models_payload(payload)
 
 
@@ -1976,8 +2526,9 @@ def _service_hardware(url: str) -> dict:
     try:
         import json as _json
         import urllib.request
-        with urllib.request.urlopen(url.rstrip("/") + "/hardware",
-                                    timeout=2) as response:
+        with urllib.request.urlopen(
+                _health_request(_service_root(url) + "/hardware"),
+                timeout=2) as response:
             payload = _json.loads(response.read().decode("utf-8", "replace"))
     except Exception:
         return {}
@@ -1990,37 +2541,63 @@ def _service_hardware(url: str) -> dict:
     }
 
 
-def _service_status(name: str, url: str) -> dict:
+def _service_status(name: str, url: str, provider: dict | None = None) -> dict:
+    base = {
+        "name": name,
+        "url": url,
+        "provider_id": (provider or {}).get("id", ""),
+        "provider_name": (provider or {}).get("provider_name", ""),
+    }
     if not url:
-        return {"name": name, "url": "", "state": "not_configured"}
-    health_url = url.rstrip("/") + "/health"
+        return {**base, "state": "not_configured"}
+    if provider and provider.get("ignore_health"):
+        return {
+            **base, "state": "ignored",
+            "detail": "已忽略运行状态检查",
+            "health_supported": True,
+        }
+    health_url = _service_root(url) + "/health"
     try:
         import urllib.request
-        with urllib.request.urlopen(health_url, timeout=2) as response:
-            state = "ok"
+        with urllib.request.urlopen(_health_request(health_url),
+                                    timeout=2) as response:
             status = response.status
     except Exception as exc:
-        return {"name": name, "url": url, "state": "unreachable",
-                "detail": str(exc)[:200]}
+        models = _service_models(url)
+        if models is not None:
+            return {
+                **base, "state": "ok", "health_supported": False,
+                "detail": "该服务不支持 /health 检查；已通过 /v1/models 确认可用",
+                "models": models, "hardware": {},
+            }
+        return {**base, "state": "unreachable",
+                "detail": str(exc)[:200], "health_supported": True}
     return {
-        "name": name, "url": url, "state": state, "http": status,
-        "models": _service_models(url),
+        **base, "state": "ok", "health_supported": True, "http": status,
+        "models": _service_models(url) or {
+            "loaded": [], "available": [], "count": 0},
         "hardware": _service_hardware(url),
     }
 
 
 def _health_status(root: Path) -> dict:
     settings = load_settings(root)
+
+    def active_provider(service: str) -> dict | None:
+        ref = settings[service]["active_provider_id"]
+        provider = next((item for item in settings["providers"]
+                         if item["id"] == ref and item["service"] == service),
+                        None)
+        if provider is None:
+            provider = next((item for item in settings["providers"]
+                             if item["service"] == service), None)
+        return provider
+
     services = []
-    asr_url = (os.environ.get(CLOUD_ASR_URL) or ""
-               if settings["asr"].get("mode") == "cloud"
-               else os.environ.get(LOCAL_ASR_URL,
-                                   "http://127.0.0.1:8081"))
-    mt_url = (os.environ.get(CLOUD_MT_URL) or ""
-              if settings["mt"].get("mode") == "cloud"
-              else os.environ.get(LOCAL_MT_URL, "http://127.0.0.1:8080"))
-    services.append(_service_status("ASR", asr_url))
-    services.append(_service_status("MT", mt_url))
+    for service, label in (("asr", "ASR"), ("mt", "MT")):
+        provider = active_provider(service)
+        services.append(_service_status(
+            label, str((provider or {}).get("base_url") or ""), provider))
     return {"collected_at": now_iso(), "services": services}
 
 
@@ -2035,16 +2612,34 @@ def _routes() -> list:
         Route("/api/v1/health", health),
         Route("/api/v1/health/status", health_status),
         Route("/api/v1/settings", settings_view, methods=["GET", "PATCH"]),
+        Route("/api/v1/settings/models", provider_models, methods=["POST"]),
         Route("/api/v1/termbases", all_termbases),
         Route("/api/v1/tm", all_tm),
         Route("/api/v1/tm/export.tmx", tm_export),
         Route("/api/v1/board", board_view),
         Route("/api/v1/board/move", board_move, methods=["POST"]),
-        Route("/api/v1/settings", settings_view, methods=["GET", "PATCH"]),
         Route("/api/v1/system", system_info),
         Route("/api/v1/workspace", workspace),
         Route("/api/v1/projects", projects, methods=["GET", "POST"]),
-        Route("/api/v1/projects/{project_id}", project_detail),
+        Route("/api/v1/projects/{project_id}", project_detail,
+              methods=["GET", "PATCH"]),
+        Route("/api/v1/projects/{project_id}/board", board_project_view),
+        Route("/api/v1/projects/{project_id}/overview", project_overview),
+        Route("/api/v1/projects/{project_id}/activity", project_activity),
+        Route("/api/v1/projects/{project_id}/features",
+              project_features, methods=["PATCH"]),
+        Route("/api/v1/projects/{project_id}/automation",
+              project_automation, methods=["GET", "POST"]),
+        Route("/api/v1/projects/{project_id}/automation/{rule_id}",
+              automation_detail, methods=["PATCH", "DELETE"]),
+        Route("/api/v1/projects/{project_id}/categories",
+              categories_view, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/categories/{category_id}",
+              category_detail, methods=["PATCH", "DELETE"]),
+        Route("/api/v1/projects/{project_id}/categories/{category_id}/lanes",
+              lanes_view, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/categories/{category_id}/lanes/{lane_id}",
+              lane_detail, methods=["PATCH", "DELETE"]),
         Route("/api/v1/projects/{project_id}/actions/{action}",
               project_actions, methods=["POST"]),
         Route("/api/v1/projects/{project_id}/segments",
@@ -2077,9 +2672,29 @@ def _routes() -> list:
         Route("/api/v1/projects/{project_id}/subprojects",
               subprojects, methods=["GET", "POST"]),
         Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}",
-              subproject_detail, methods=["GET", "PATCH"]),
+              subproject_detail, methods=["GET", "PATCH", "DELETE"]),
         Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/actions/{action}",
               subproject_actions, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/subtasks",
+              subproject_subtasks, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/subtasks/{task_id}",
+              subtask_detail, methods=["PATCH", "DELETE"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/internal-links",
+              internal_links, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/internal-links/{link_id}",
+              internal_link_detail, methods=["DELETE"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/external-links",
+              external_links, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/external-links/{link_id}",
+              external_link_detail, methods=["DELETE"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/comments",
+              subproject_comments, methods=["POST"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/comments/{comment_id}",
+              comment_detail, methods=["DELETE"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/attachments",
+              subproject_attachments, methods=["GET", "POST"]),
+        Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/attachments/{attachment_id}",
+              attachment_detail, methods=["GET", "DELETE"]),
         Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/segments",
               subproject_segments, methods=["GET", "POST"]),
         Route("/api/v1/projects/{project_id}/subprojects/{subproject_id}/segments/{segment_id}",

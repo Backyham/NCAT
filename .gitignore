@@ -16,9 +16,6 @@ eval_out/
 corpus/
 *.log
 
-# Ground Truth media and subtitle sources (large, per-machine)
-GT/
-
 # Documents - Do not remove, might contain sensitive materials that should not be committed
 docs/
 AGENT*

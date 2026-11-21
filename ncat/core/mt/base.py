@@ -40,6 +40,7 @@ class MTRequest:
     segments: list[SegmentInput]
     document_brief: str = ""
     style: str = ""
+    genre: str = "字幕"
     constraints: dict[str, Any] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=dict)
 
